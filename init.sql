@@ -1,11 +1,11 @@
 -- Schema completo per progetto.io
 
--- Tabella Users
+-- Tabella Users (senza FK a technicians, aggiunta dopo)
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     password VARCHAR(255) NOT NULL,
-    name VARCHAR(100),
+    name VARCHAR(255),
     role VARCHAR(20) NOT NULL DEFAULT 'viewer',
     phone VARCHAR(20),
     active BOOLEAN DEFAULT true,
@@ -26,6 +26,9 @@ CREATE TABLE technicians (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Aggiunta FK technician_id su users (dopo creazione technicians)
+ALTER TABLE users ADD COLUMN technician_id INTEGER REFERENCES technicians(id);
 
 -- Tabella Projects
 CREATE TABLE projects (
@@ -58,6 +61,15 @@ CREATE TABLE activities (
     created_by INTEGER REFERENCES users(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Tabella Activity Technicians (tecnici multipli per attività)
+CREATE TABLE activity_technicians (
+    id SERIAL PRIMARY KEY,
+    activity_id INTEGER REFERENCES activities(id) ON DELETE CASCADE,
+    technician_id INTEGER REFERENCES technicians(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(activity_id, technician_id)
 );
 
 -- Inserisci utenti (password: admin123)
