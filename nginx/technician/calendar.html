@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Le Mie Attività - Progetto.io</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css" rel="stylesheet">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#667eea">
+    <style>
+        body { background-color: #f8f9fa; }
+        .activity-card { transition: transform 0.2s; }
+        .activity-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .status-badge {
+            font-size: 0.85rem;
+            padding: 0.35rem 0.75rem;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-primary px-3 shadow">
+        <span class="navbar-brand mb-0 h1">
+            <i class="bi bi-calendar-check"></i> Le Mie Attività
+        </span>
+        <div>
+            <span class="text-white me-3" id="userName"></span>
+            <button class="btn btn-outline-light btn-sm" onclick="logout()">
+                <i class="bi bi-box-arrow-right"></i> Esci
+            </button>
+        </div>
+    </nav>
+
+    <main class="container py-4">
+        <div class="row mb-3">
+            <div class="col-12 col-md-6 mb-2">
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="showPast" onchange="loadActivities()">
+                    <label class="form-check-label" for="showPast">Mostra attività passate</label>
+                </div>
+            </div>
+            <div class="col-12 col-md-6">
+                <input type="text" id="searchInput" class="form-control" placeholder="🔍 Cerca un'attività...">
+            </div>
+        </div>
+
+        <div id="loading" class="text-center py-5">
+            <div class="spinner-border text-primary" role="status"></div>
+            <p class="mt-2">Caricamento attività...</p>
+        </div>
+
+        <div id="activities" class="d-none"></div>
+        <div id="noActivities" class="alert alert-info d-none">
+            <i class="bi bi-info-circle"></i> Nessuna attività trovata.
+        </div>
+    </main>
+<script>
+        const API_URL = '/api';
+        let allActivities = [];
+        const token = localStorage.getItem('tech_token');
+        const user = JSON.parse(localStorage.getItem('tech_user') || '{}');
+
+        if (!token || !user.technician_id) {
+            window.location.href = 'index.html';
+        }
+
+        document.getElementById('userName').textContent = user.name;
+
+        async function loadActivities() {
+            const showPast = document.getElementById('showPast').checked;
+            try {
+                const response = await fetch(`${API_URL}/activities`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (!response.ok) throw new Error('Errore nel caricamento');
+                const activities = await response.json();
+                allActivities = activities.filter(a => 
+                    a.technicians && a.technicians.some(t => t.id === user.technician_id)
+                );
+                const today = new Date().toISOString().split('T')[0];
+                const filtered = showPast ? allActivities : allActivities.filter(a => a.end_date >= today);
+                filtered.sort((a, b) => a.start_date.localeCompare(b.start_date));
+                displayActivities(filtered);
+            } catch (error) {
+                document.getElementById('loading').classList.add('d-none');
+                alert('Errore nel caricamento delle attività');
+            }
+        }
+
+        function displayActivities(activities) {
+            document.getElementById('loading').classList.add('d-none');
+            const container = document.getElementById('activities');
+            const noActivities = document.getElementById('noActivities');
+            if (activities.length === 0) {
+                container.classList.add('d-none');
+                noActivities.classList.remove('d-none');
+                return;
+            }
+            container.classList.remove('d-none');
+            noActivities.classList.add('d-none');
+            container.innerHTML = activities.map(a => {
+                const startDate = new Date(a.start_date).toLocaleDateString('it-IT');
+                const endDate = new Date(a.end_date).toLocaleDateString('it-IT');
+                const isPast = a.end_date < new Date().toISOString().split('T')[0];
+                const statusClass = isPast ? 'bg-secondary' : (a.progress === 100 ? 'bg-success' : 'bg-primary');
+                return `<div class="card activity-card mb-3 shadow-sm"><div class="card-body"><div class="d-flex justify-content-between align-items-start mb-2"><h5 class="card-title mb-0">${a.name}</h5><span class="badge ${statusClass} status-badge">${a.progress}%</span></div><p class="card-text text-muted mb-2"><i class="bi bi-calendar-event"></i> ${startDate} - ${endDate}</p><p class="card-text mb-2"><i class="bi bi-people"></i> <strong>Tecnici:</strong> ${a.technicians.map(t => t.name).join(', ')}</p>${isPast ? '<span class="badge bg-secondary">Completata</span>' : ''}</div></div>`;
+            }).join('');
+        }
+
+        document.getElementById('searchInput').addEventListener('input', function() {
+            const query = this.value.toLowerCase();
+            document.querySelectorAll('.activity-card').forEach(card => {
+                card.style.display = card.textContent.toLowerCase().includes(query) ? '' : 'none';
+            });
+        });
+
+        function logout() {
+            localStorage.removeItem('tech_token');
+            localStorage.removeItem('tech_user');
+            window.location.href = 'index.html';
+        }
+
+        loadActivities();
+    </script>
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/technician/sw.js')
+                .then(() => console.log('Service Worker registrato'))
+                .catch(err => console.log('Service Worker errore:', err));
+        }
+    </script>
+</body>
+</html>

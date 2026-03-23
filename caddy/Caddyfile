@@ -1,0 +1,11 @@
+{$CADDY_DOMAIN} {
+    reverse_proxy /api* backend:5000
+    handle /technician/* {
+        root * /srv/technician
+        file_server
+    }
+    reverse_proxy * frontend:80
+    request_body {
+        max_size 10MB
+    }
+}

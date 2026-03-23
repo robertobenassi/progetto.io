@@ -1,0 +1,7 @@
+.env
+node_modules/
+frontend/build/
+*.log
+*.sql.backup
+caddy/data/
+caddy/config/
