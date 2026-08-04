@@ -99,6 +99,21 @@ const initDB = async () => {
       );
     `);
 
+    // --- Migrazioni idempotenti ---
+    // users.technician_id non e' nella CREATE TABLE ma viene letta dal login:
+    // senza questa ALTER ogni installazione pulita fallisce con "column does not exist".
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS technician_id INTEGER REFERENCES technicians(id);
+    `);
+
+    // Indici: necessari con centinaia di progetti e migliaia di attivita'
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_activities_project  ON activities(project_id);
+      CREATE INDEX IF NOT EXISTS idx_activities_dates    ON activities(start_date, end_date);
+      CREATE INDEX IF NOT EXISTS idx_act_tech_technician ON activity_technicians(technician_id);
+      CREATE INDEX IF NOT EXISTS idx_act_tech_activity   ON activity_technicians(activity_id);
+    `);
+
     // Create default admin user if not exists
     const userCheck = await pool.query('SELECT * FROM users WHERE email = $1', ['admin@progetto.io']);
     if (userCheck.rows.length === 0) {
@@ -113,6 +128,16 @@ const initDB = async () => {
   } catch (error) {
     console.error('Database initialization error:', error);
   }
+};
+
+// Validazione date attivita': il form e' cosmetico, l'API va protetta comunque.
+const validateActivityDates = (start_date, end_date) => {
+  if (!start_date || !end_date) return 'Data di inizio e data di fine sono obbligatorie';
+  const s = new Date(start_date);
+  const e = new Date(end_date);
+  if (isNaN(s.getTime()) || isNaN(e.getTime())) return 'Formato data non valido';
+  if (e < s) return 'La data di fine non puo\' precedere quella di inizio';
+  return null;
 };
 
 // Health check
@@ -265,9 +290,11 @@ app.get('/api/activities', authenticateToken, async (req, res) => {
 app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { name, project_id, technician_ids, start_date, end_date, progress } = req.body;
 
-console.log('POST /api/activities - Body:', req.body);
-  console.log('Technician IDs:', technician_ids);
-  
+  const dateError = validateActivityDates(start_date, end_date);
+  if (dateError) {
+    return res.status(400).json({ message: dateError });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -304,7 +331,12 @@ console.log('POST /api/activities - Body:', req.body);
 app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
   const { name, project_id, technician_ids, start_date, end_date, progress } = req.body;
-  
+
+  const dateError = validateActivityDates(start_date, end_date);
+  if (dateError) {
+    return res.status(400).json({ message: dateError });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

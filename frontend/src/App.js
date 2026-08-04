@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
 import axios from 'axios';
 
@@ -28,13 +28,10 @@ const App = () => {
   const [loginData, setLoginData] = useState({ email: '', password: '' });
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const leftColumnRef = useRef(null);
-  const timelineRef = useRef(null);
-  const handleTimelineScroll = (e) => {
-    if (leftColumnRef.current) {
-      leftColumnRef.current.scrollTop = e.target.scrollTop;
-    }
-  };
+  const [groupBy, setGroupBy] = useState('project');
+  const [expandedTechs, setExpandedTechs] = useState([]);
+  const [formStart, setFormStart] = useState('');
+  const [formEnd, setFormEnd] = useState('');
   const [showUserModal, setShowUserModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [newUser, setNewUser] = useState({ email: '', password: '', name: '', role: 'viewer', phone: '' });
@@ -353,6 +350,38 @@ const handleSaveActivity = async (activityData) => {
     return date.toLocaleDateString('it-IT', { month: 'long', year: 'numeric' });
   };
 
+  // ---- Gestione date attività ----
+  const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+
+  const addDays = (dateStr, n) => {
+    const d = new Date(dateStr);
+    d.setDate(d.getDate() + n);
+    return formatDateForInput(d);
+  };
+
+  // Cambiando l'inizio, la fine trasla della stessa durata (come MS Project / Jira).
+  // Cambiando la fine, l'inizio resta fermo: e' cosi' che si accorcia o allunga.
+  const handleStartChange = (value) => {
+    if (!value) { setFormStart(value); return; }
+    if (formStart && formEnd) {
+      const dur = daysBetween(formStart, formEnd);
+      if (dur >= 0) setFormEnd(addDays(value, dur));
+    } else if (!formEnd) {
+      setFormEnd(value);
+    }
+    setFormStart(value);
+  };
+
+  const dateError = Boolean(formStart && formEnd && new Date(formEnd) < new Date(formStart));
+  const durationDays = (formStart && formEnd && !dateError) ? daysBetween(formStart, formEnd) + 1 : null;
+
+  useEffect(() => {
+    if (showActivityModal || showEditModal) {
+      setFormStart(editingActivity?.start_date ? formatDateForInput(editingActivity.start_date) : '');
+      setFormEnd(editingActivity?.end_date ? formatDateForInput(editingActivity.end_date) : '');
+    }
+  }, [showActivityModal, showEditModal, editingActivity]);
+
   const isDateInRange = (date, startDate, endDate) => {
     const d = new Date(date);
     d.setHours(0, 0, 0, 0);
@@ -373,202 +402,272 @@ const handleSaveActivity = async (activityData) => {
   return techActivities.length > 1;
 };
 
+  const toggleTech = (techId) => {
+    setExpandedTechs(prev =>
+      prev.includes(techId) ? prev.filter(id => id !== techId) : [...prev, techId]
+    );
+  };
+
   const renderGanttChart = () => {
-    const dates = viewMode === 'week' ? currentDates : getMonthDates(currentMonth);
-    
-    return (
-      <div style={{ display: 'flex', height: 'calc(100vh - 200px)', overflow: 'hidden' }}>
-        {/* Colonna Fissa Progetti/Attività */}
-        <div style={{
-          width: '300px',
+    const dates  = viewMode === 'week' ? currentDates : getMonthDates(currentMonth);
+    const DAY_W  = viewMode === 'week' ? 100 : 46;
+    const LEFT_W = 300;
+    const ROW_H  = 48;
+    const gridW  = dates.length * DAY_W;
+
+    // Sfondo griglia disegnato in CSS: 1 nodo invece di N celle per riga
+    const gridBg = {
+      backgroundImage: `repeating-linear-gradient(to right, #f0f0f0 0 1px, transparent 1px ${DAY_W}px)`,
+      backgroundSize: `${DAY_W}px 100%`,
+    };
+
+    // Posizione della barra dell'attivita' nel periodo visibile
+    const barPos = (activity) => {
+      if (!activity.start_date || !activity.end_date) return null;
+      const first = new Date(dates[0]);                     first.setHours(0,0,0,0);
+      const last  = new Date(dates[dates.length - 1]);      last.setHours(0,0,0,0);
+      const s = new Date(activity.start_date);              s.setHours(0,0,0,0);
+      const e = new Date(activity.end_date);                e.setHours(0,0,0,0);
+      if (e < first || s > last) return null;
+
+      const dayMs = 86400000;
+      const startIdx = Math.max(0, Math.round((s - first) / dayMs));
+      const endIdx   = Math.min(dates.length - 1, Math.round((e - first) / dayMs));
+      return { left: startIdx * DAY_W, width: (endIdx - startIdx + 1) * DAY_W };
+    };
+
+    // Giorni occupati nel periodo visibile (indicatore di carico)
+    const loadDays = (acts) => {
+      const busy = new Set();
+      acts.forEach(a => {
+        const p = barPos(a);
+        if (!p) return;
+        const from = p.left / DAY_W;
+        const to   = from + p.width / DAY_W;
+        for (let i = from; i < to; i++) busy.add(i);
+      });
+      return busy.size;
+    };
+
+    const isToday = (d) => new Date().toDateString() === d.toDateString();
+
+    // ---- Cella sinistra sticky ----
+    const LeftCell = ({ children, bg, onClick, indent }) => (
+      <div
+        onClick={onClick}
+        style={{
+          position: 'sticky', left: 0, zIndex: 5,
+          width: LEFT_W, minWidth: LEFT_W,
+          padding: indent ? '0 8px 0 28px' : '0 8px',
+          display: 'flex', flexDirection: 'column', justifyContent: 'center',
+          backgroundColor: bg,
           borderRight: '2px solid #e5e7eb',
-          backgroundColor: '#f9fafb',
-          flexShrink: 0,
-          overflow: 'hidden'
+          cursor: onClick ? 'pointer' : 'default',
+          overflow: 'hidden',
         }}>
-          {/* Header Fisso */}
-          <div style={{
-            position: 'sticky',
-            top: 0,
-            backgroundColor: '#f3f4f6',
-            fontWeight: 'bold',
-            borderBottom: '2px solid #e5e7eb',
-            zIndex: 10,
-            height: '50px',
-            display: 'flex',
-            alignItems: 'center'
-          }}>
-            <div>Progetto / Attività</div>
-          </div>
-          
-          {/* Lista Progetti - SENZA SCROLL PROPRIO */}
-          <div ref={leftColumnRef} style={{ overflowY: 'auto', overflowX: 'hidden', height: 'calc(100vh - 200px)' }}>
-            {projects.map(project => (
-              <div key={project.id}>
-                {/* Riga Progetto */}
-                <div style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  padding: '6px 8px',
-                  backgroundColor: '#ffffff',
-                  borderBottom: '1px solid #e5e7eb',
-                  cursor: 'pointer',
-                  fontWeight: '600',
-                  height: '48px'
+        {children}
+      </div>
+    );
+
+    // ---- Riga attivita' (usata da entrambe le viste) ----
+    const ActivityRow = ({ activity, label, sub, color }) => {
+      const pos = barPos(activity);
+      const techs = activity.technicians || [];
+      const conflict = techs.some(t => getTechnicianConflicts(t.id, new Date(activity.start_date)));
+      return (
+        <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid #f0f0f0', backgroundColor: '#fafafa' }}>
+          <LeftCell bg="#fafafa" indent>
+            <div style={{ fontSize: 13, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{label}</div>
+            <div style={{ fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{sub}</div>
+          </LeftCell>
+          <div style={{ width: gridW, minWidth: gridW, position: 'relative', ...gridBg }}>
+            {pos && (
+              <div
+                onClick={() => {
+                  setEditingActivity(activity);
+                  setSelectedTechnicians(techs.map(t => t.id));
+                  setShowEditModal(true);
                 }}
-                onClick={() => toggleProject(project.id)}>
-                  {project.expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                  <span style={{ marginLeft: '8px', color: project.color || '#3b82f6' }}>
-                    {project.code} - {project.name}
-                  </span>
-                </div>
-                
-                {/* Righe Attività */}
-                {project.expanded && activities
-                  .filter(a => a.project_id === project.id)
-                  .map(activity => {
-                    const activityTechnicians = activity.technicians || [];
-                    return (
-                      <div key={activity.id} style={{
-                        padding: '6px 8px',
-                        backgroundColor: '#fafafa',
-                        borderBottom: '1px solid #f0f0f0',
-                        fontSize: '0.9rem',
-                        height: '48px',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        justifyContent: 'center'
-                      }}>
-                        <div>{activity.name}</div>
-			<div style={{ fontSize: '0.8rem', color: '#6b7280', marginTop: '4px' }}>
-  {activityTechnicians.length > 0 ? activityTechnicians.map(t => t.name).join(', ') : 'Non assegnato'}
-</div>                        
-                      </div>
-                    );
-                  })}
+                title={`${activity.name} — ${activity.start_date} → ${activity.end_date}`}
+                style={{
+                  position: 'absolute', top: 8, height: ROW_H - 16,
+                  left: pos.left, width: pos.width,
+                  backgroundColor: conflict ? '#ef4444' : (color || '#3b82f6'),
+                  borderRadius: 4, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 12, color: 'white', fontWeight: 500,
+                  boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                  overflow: 'hidden', whiteSpace: 'nowrap',
+                }}>
+                {activity.progress != null ? `${activity.progress}%` : ''}
               </div>
-            ))}
+            )}
           </div>
         </div>
+      );
+    };
 
-        {/* Area Scrollabile Gantt - CON SCROLL VERTICALE */}
-        <div ref={timelineRef} onScroll={handleTimelineScroll} style={{ flex: 1, overflowX: 'auto', overflowY: 'auto', height: 'calc(100vh - 200px)' }}>
-          <div style={{ minWidth: `${dates.length * 100}px` }}>
-            {/* Header Date - STICKY */}
+    return (
+      <div>
+        {/* Toggle raggruppamento */}
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          {[['project', 'Per Progetto'], ['technician', 'Per Tecnico']].map(([key, label]) => (
+            <button key={key} onClick={() => setGroupBy(key)}
+              style={{
+                padding: '6px 14px', borderRadius: 5, border: 'none', cursor: 'pointer', fontSize: 13,
+                backgroundColor: groupBy === key ? '#667eea' : '#e5e7eb',
+                color: groupBy === key ? 'white' : '#333',
+              }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* UN SOLO contenitore scorrevole: la colonna sinistra e' sticky, non puo' sfasarsi */}
+        <div style={{
+          overflow: 'auto',
+          height: 'calc(100vh - 240px)',
+          border: '1px solid #e5e7eb',
+          borderRadius: 8,
+        }}>
+          <div style={{ width: LEFT_W + gridW, position: 'relative' }}>
+
+            {/* HEADER date */}
             <div style={{
-              position: 'sticky',
-              top: 0,
-              display: 'flex',
+              position: 'sticky', top: 0, zIndex: 15,
+              display: 'flex', height: ROW_H,
               backgroundColor: '#f3f4f6',
               borderBottom: '2px solid #e5e7eb',
-              zIndex: 10
             }}>
-              {dates.map((date, index) => (
-                <div key={index} style={{
-                  width: '100px',
-                  textAlign: 'center',
-                  fontWeight: 'bold',
+              <div style={{
+                position: 'sticky', left: 0, zIndex: 20,
+                width: LEFT_W, minWidth: LEFT_W,
+                padding: '0 12px',
+                display: 'flex', alignItems: 'center',
+                fontWeight: 700, fontSize: 13,
+                backgroundColor: '#f3f4f6',
+                borderRight: '2px solid #e5e7eb',
+              }}>
+                {groupBy === 'project' ? 'Progetto / Attività' : 'Tecnico / Impegni'}
+              </div>
+              {dates.map((date, i) => (
+                <div key={i} style={{
+                  width: DAY_W, minWidth: DAY_W,
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', justifyContent: 'center',
                   borderRight: '1px solid #e5e7eb',
-                  fontSize: '0.85rem',
-                  height: '48px',
-		  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  }}>
-                  <div>{formatDate(date)}</div>
-                  <div style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                  backgroundColor: isToday(date) ? '#dbeafe' : 'transparent',
+                }}>
+                  <div style={{ fontSize: viewMode === 'week' ? 13 : 11, fontWeight: 700 }}>{formatDate(date)}</div>
+                  <div style={{ fontSize: 10, color: '#6b7280' }}>
                     {date.toLocaleDateString('it-IT', { weekday: 'short' })}
                   </div>
                 </div>
               ))}
             </div>
 
-            {/* Righe Gantt */}
-            {projects.map(project => (
-              <div key={project.id}>
-                {/* Riga Progetto */}
-                <div style={{
-                  display: 'flex',
-                  height: '48px',
-                  backgroundColor: '#ffffff',
-                  borderBottom: '1px solid #e5e7eb'
-                }}>
-                  {dates.map((date, index) => (
-                    <div key={index} style={{
-                      width: '100px',
-                      borderRight: '1px solid #f0f0f0',
-                      position: 'relative'
-                    }} />
+            {/* ===== VISTA PER PROGETTO ===== */}
+            {groupBy === 'project' && projects.map(project => {
+              const acts = activities.filter(a => a.project_id === project.id);
+              return (
+                <div key={project.id}>
+                  <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid #e5e7eb', backgroundColor: '#ffffff' }}>
+                    <LeftCell bg="#ffffff" onClick={() => toggleProject(project.id)}>
+                      <div style={{ display: 'flex', alignItems: 'center', fontWeight: 600, fontSize: 13 }}>
+                        {project.expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                        <span style={{ marginLeft: 8, color: project.color || '#3b82f6', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                          {project.code} - {project.name}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 11, color: '#9ca3af', marginLeft: 24 }}>
+                        {acts.length} attività
+                      </div>
+                    </LeftCell>
+                    <div style={{ width: gridW, minWidth: gridW, ...gridBg }} />
+                  </div>
+
+                  {project.expanded && acts.map(activity => (
+                    <ActivityRow
+                      key={activity.id}
+                      activity={activity}
+                      label={activity.name}
+                      sub={(activity.technicians || []).map(t => t.name).join(', ') || 'Non assegnato'}
+                      color={project.color}
+                    />
                   ))}
                 </div>
+              );
+            })}
 
-                {/* Righe Attività */}
-                {project.expanded && activities
-                  .filter(a => a.project_id === project.id)
-                  .map(activity => {
-                    const activityTechnicians = activity.technicians || [];
-                    return (
-                      <div key={activity.id} style={{
-                        display: 'flex',
-                        height: '48px',
-                        backgroundColor: '#fafafa',
-                        borderBottom: '1px solid #f0f0f0',
-                        position: 'relative'
-                      }}>
-                        {dates.map((date, index) => {
-                          const dateStr = date.toISOString().split('T')[0];
-                          const isInRange = isDateInRange(dateStr, activity.start_date, activity.end_date);
-                          const hasConflict = activityTechnicians.some(tech => getTechnicianConflicts(tech.id, date));
-                          
-                          return (
-                            <div key={index} style={{
-                              width: '100px',
-                              borderRight: '1px solid #f0f0f0',
-                              position: 'relative',
-                              padding: '8px 4px'
-                            }}>
-                              {isInRange && (
-                                <div
-                                  onClick={() => {
-  setEditingActivity(activity);
-  setSelectedTechnicians(activity.technicians?.map(t => t.id) || []);
-  setShowEditModal(true);
-}}
-                                  style={{
-                                    height: '32px',
-                                    backgroundColor: hasConflict ? '#ef4444' : (project.color || '#3b82f6'),
-                                    borderRadius: '4px',
-                                    cursor: 'pointer',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                    fontSize: '0.75rem',
-                                    color: 'white',
-                                    fontWeight: '500',
-                                    transition: 'all 0.2s',
-                                    boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-                                  }}
-                                  onMouseEnter={(e) => {
-                                    e.currentTarget.style.transform = 'scale(1.05)';
-                                    e.currentTarget.style.boxShadow = '0 4px 8px rgba(0,0,0,0.2)';
-                                  }}
-                                  onMouseLeave={(e) => {
-                                    e.currentTarget.style.transform = 'scale(1)';
-                                    e.currentTarget.style.boxShadow = '0 2px 4px rgba(0,0,0,0.1)';
-                                  }}
-                                  
-                                >
-                                  {activity.progress}%
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
+            {/* ===== VISTA PER TECNICO ===== */}
+            {groupBy === 'technician' && technicians.map(tech => {
+              const acts = activities.filter(a =>
+                (a.technicians || []).some(t => t.id === tech.id)
+              );
+              const expanded = expandedTechs.includes(tech.id);
+              const busy = loadDays(acts);
+              const pct  = Math.round((busy / dates.length) * 100);
+
+              return (
+                <div key={tech.id}>
+                  <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid #e5e7eb', backgroundColor: '#ffffff' }}>
+                    <LeftCell bg="#ffffff" onClick={() => toggleTech(tech.id)}>
+                      <div style={{ display: 'flex', alignItems: 'center', fontWeight: 600, fontSize: 13 }}>
+                        {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                        <span style={{
+                          marginLeft: 8, width: 10, height: 10, borderRadius: '50%',
+                          backgroundColor: tech.color || '#3b82f6', display: 'inline-block', flexShrink: 0,
+                        }} />
+                        <span style={{ marginLeft: 8, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                          {tech.name}
+                        </span>
                       </div>
+                      <div style={{ fontSize: 11, color: '#9ca3af', marginLeft: 24 }}>
+                        Carico: {busy}/{dates.length} gg ({pct}%)
+                      </div>
+                    </LeftCell>
+
+                    {/* Barre compatte anche a gruppo chiuso: sovrapposizioni = conflitto */}
+                    <div style={{ width: gridW, minWidth: gridW, position: 'relative', ...gridBg }}>
+                      {!expanded && acts.map(a => {
+                        const p = barPos(a);
+                        if (!p) return null;
+                        const prj = projects.find(pr => pr.id === a.project_id);
+                        return (
+                          <div key={a.id}
+                            title={`${prj ? prj.code + ' — ' : ''}${a.name}`}
+                            style={{
+                              position: 'absolute', top: 14, height: 20,
+                              left: p.left, width: p.width,
+                              backgroundColor: prj?.color || '#3b82f6',
+                              borderRadius: 3, opacity: 0.85,
+                              fontSize: 10, color: 'white',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              overflow: 'hidden', whiteSpace: 'nowrap',
+                            }}>
+                            {prj?.code || ''}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {expanded && acts.map(activity => {
+                    const prj = projects.find(pr => pr.id === activity.project_id);
+                    return (
+                      <ActivityRow
+                        key={activity.id}
+                        activity={activity}
+                        label={activity.name}
+                        sub={prj ? `${prj.code} - ${prj.name}` : 'Progetto sconosciuto'}
+                        color={prj?.color}
+                      />
                     );
                   })}
-              </div>
-            ))}
+                </div>
+              );
+            })}
+
           </div>
         </div>
       </div>
@@ -1566,14 +1665,15 @@ const handleSaveActivity = async (activityData) => {
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
+                  disabled={dateError}
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#667eea',
+                    backgroundColor: dateError ? '#c7c9d1' : '#667eea',
                     color: 'white',
                     border: 'none',
                     borderRadius: '5px',
-                    cursor: 'pointer',
+                    cursor: dateError ? 'not-allowed' : 'pointer',
                     fontWeight: '600'
                   }}
                 >
@@ -1709,14 +1809,15 @@ const handleSaveActivity = async (activityData) => {
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
+                  disabled={dateError}
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#667eea',
+                    backgroundColor: dateError ? '#c7c9d1' : '#667eea',
                     color: 'white',
                     border: 'none',
                     borderRadius: '5px',
-                    cursor: 'pointer',
+                    cursor: dateError ? 'not-allowed' : 'pointer',
                     fontWeight: '600'
                   }}
                 >
@@ -1771,13 +1872,14 @@ const handleSaveActivity = async (activityData) => {
             <h3 style={{ marginTop: 0 }}>{editingActivity?.id ? 'Modifica Attività' : 'Nuova Attività'}</h3>
             <form onSubmit={(e) => {
               e.preventDefault();
+              if (dateError) return;
               const formData = new FormData(e.target);
               handleSaveActivity({
                 name: formData.get('name'),
                 project_id: parseInt(formData.get('project_id')),
                 technician_ids: selectedTechnicians,
-                start_date: formData.get('start_date'),
-                end_date: formData.get('end_date'),
+                start_date: formStart,
+                end_date: formEnd,
                 progress: parseInt(formData.get('progress'))
               });
             }}>
@@ -1847,13 +1949,14 @@ const handleSaveActivity = async (activityData) => {
     ))}
   </div>
 </div>
-              <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
+              <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem' }}>
                 <div style={{ flex: 1 }}>
                   <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Data Inizio</label>
                   <input
                     name="start_date"
                     type="date"
-                    defaultValue={editingActivity?.start_date ? formatDateForInput(editingActivity.start_date) : ''}
+                    value={formStart}
+                    onChange={(e) => handleStartChange(e.target.value)}
                     required
                     style={{
                       width: '100%',
@@ -1869,17 +1972,32 @@ const handleSaveActivity = async (activityData) => {
                   <input
                     name="end_date"
                     type="date"
-                    defaultValue={editingActivity?.end_date ? formatDateForInput(editingActivity.end_date) : ''}
+                    value={formEnd}
+                    min={formStart || undefined}
+                    onChange={(e) => setFormEnd(e.target.value)}
                     required
                     style={{
                       width: '100%',
                       padding: '0.5rem',
-                      border: '1px solid #ddd',
+                      border: dateError ? '2px solid #ef4444' : '1px solid #ddd',
                       borderRadius: '5px',
-                      boxSizing: 'border-box'
+                      boxSizing: 'border-box',
+                      backgroundColor: dateError ? '#fef2f2' : 'white'
                     }}
                   />
                 </div>
+              </div>
+
+              <div style={{ marginBottom: '1rem', minHeight: '20px' }}>
+                {dateError ? (
+                  <span style={{ color: '#ef4444', fontSize: '0.85rem' }}>
+                    La data di fine non puo' precedere quella di inizio.
+                  </span>
+                ) : durationDays ? (
+                  <span style={{ color: '#6b7280', fontSize: '0.85rem' }}>
+                    Durata: {durationDays} {durationDays === 1 ? 'giorno' : 'giorni'} di calendario
+                  </span>
+                ) : null}
               </div>
               <div style={{ marginBottom: '1rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Progresso (%)</label>
@@ -1902,14 +2020,15 @@ const handleSaveActivity = async (activityData) => {
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
+                  disabled={dateError}
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#667eea',
+                    backgroundColor: dateError ? '#c7c9d1' : '#667eea',
                     color: 'white',
                     border: 'none',
                     borderRadius: '5px',
-                    cursor: 'pointer',
+                    cursor: dateError ? 'not-allowed' : 'pointer',
                     fontWeight: '600'
                   }}
                 >
