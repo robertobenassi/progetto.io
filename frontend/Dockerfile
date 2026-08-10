@@ -5,8 +5,10 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-FROM nginx@sha256:42a516af16b852e33b7682d5ef8acbd5d13fe08fecadc7ed98605ba5e3b26ab8
-COPY --from=builder /app/build /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Caddy al posto di nginx: la configurazione e' un terzo delle righe e il
+# progetto usa un solo strumento invece di due. Qui non gestisce certificati,
+# se ne occupa il reverse proxy davanti.
+FROM caddy@sha256:fce4f15aad23222c0ac78a1220adf63bae7b94355d5ea28eee53910624acedfa
+COPY --from=builder /app/build /srv
+COPY Caddyfile /etc/caddy/Caddyfile
 EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]

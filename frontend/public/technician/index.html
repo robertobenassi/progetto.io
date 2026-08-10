@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>Progetto.io — Tecnico</title>
+<style>
+  :root {
+    --bg:#f2f2f2; --fg:#121212; --surface:#fff; --surface2:#f7f7f7;
+    --border:#d9d9d9; --muted:#6b6b6b; --barBg:#000; --barFg:#fff;
+  }
+  .inv {
+    --bg:#121212; --fg:#f5f5f5; --surface:#1c1c1c; --surface2:#252525;
+    --border:#3a3a3a; --muted:#9e9e9e; --barBg:#f5f5f5; --barFg:#121212;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:16px; line-height:1.45;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  header {
+    background:var(--barBg); color:var(--barFg);
+    padding:calc(10px + env(safe-area-inset-top)) 14px 10px;
+    display:flex; align-items:center; gap:10px;
+    position:sticky; top:0; z-index:10;
+  }
+  header .name { font-weight:700; font-size:16px; flex:1;
+                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  header button {
+    background:transparent; border:1px solid var(--barFg); color:var(--barFg);
+    border-radius:5px; padding:5px 9px; font-size:13px; cursor:pointer;
+  }
+  main { padding:12px; max-width:640px; margin:0 auto; }
+
+  /* Attivazione */
+  .center { min-height:75vh; display:flex; flex-direction:column;
+            align-items:center; justify-content:center; text-align:center; padding:20px; }
+  .center h1 { font-size:22px; margin:0 0 6px; }
+  .center p { color:var(--muted); font-size:15px; margin:0 0 20px; max-width:320px; }
+  .btn {
+    background:var(--fg); color:var(--bg); border:none; border-radius:8px;
+    padding:14px 26px; font-size:16px; font-weight:600; cursor:pointer; width:100%; max-width:300px;
+  }
+  .btn[disabled] { opacity:.5; }
+
+  /* Selettore periodo */
+  .tabs { display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:12px; }
+  .tabs button {
+    flex:1; background:transparent; border:none; color:var(--fg);
+    border-bottom:3px solid transparent; padding:10px 4px; font-size:14px;
+    cursor:pointer; opacity:.6;
+  }
+  .tabs button.on { border-bottom-color:var(--fg); font-weight:700; opacity:1; }
+
+  /* Giorni e schede */
+  .day { margin-bottom:18px; }
+  .day > h2 {
+    font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
+    color:var(--muted); margin:0 0 7px; padding-bottom:4px; border-bottom:1px solid var(--border);
+  }
+  .day.today > h2 { color:var(--fg); }
+  .card {
+    background:var(--surface); border:1px solid var(--border);
+    border-left:5px solid var(--muted); border-radius:7px;
+    padding:11px 13px; margin-bottom:8px;
+  }
+  .card .top { display:flex; align-items:center; gap:8px; margin-bottom:3px; }
+  .code { font-size:11px; font-weight:700; padding:2px 7px; border-radius:4px;
+          background:var(--muted); color:#fff; white-space:nowrap; }
+  .card .act { font-size:17px; font-weight:600; }
+  .card .prj { font-size:13px; color:var(--muted); }
+  .card .meta { font-size:13px; color:var(--muted); margin-top:5px;
+                display:flex; flex-wrap:wrap; gap:4px 12px; }
+  .mates { margin-top:6px; font-size:13px; }
+  .mate { display:inline-block; padding:1px 8px; border-radius:12px;
+          border:1px solid var(--border); margin:2px 4px 0 0; }
+  .abs { border-left-color:#f59e0b; background:var(--surface2); }
+  .empty { color:var(--muted); font-size:14px; padding:10px 0; }
+  .banner {
+    background:var(--surface2); border:1px solid var(--border); border-radius:6px;
+    padding:9px 12px; font-size:13px; color:var(--muted); margin-bottom:12px;
+  }
+  .err { border-color:#ef4444; color:#ef4444; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+const API = '/api';
+const KEY_TOKEN = 'tech_token';
+const KEY_TECH  = 'tech_info';
+const KEY_CACHE = 'tech_cache';
+const KEY_THEME = 'tech_inverted';
+
+const MESI = ['gennaio','febbraio','marzo','aprile','maggio','giugno',
+              'luglio','agosto','settembre','ottobre','novembre','dicembre'];
+const GIORNI = ['domenica','lunedì','martedì','mercoledì','giovedì','venerdì','sabato'];
+const TIPI = { vacation:'Ferie', sick:'Malattia', leave:'Permesso', training:'Formazione' };
+
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k,v) => { try { localStorage.setItem(k,v); } catch {} },
+  del: (k) => { try { localStorage.removeItem(k); } catch {} },
+};
+
+// Unità di mezza giornata, come nel resto dell'applicazione
+const halfUnit = (d, half, isEnd) => {
+  const days = Math.floor(new Date(d).getTime() / 86400000);
+  return isEnd ? days*2 + (half === 'AM' ? 0 : 1) : days*2 + (half === 'PM' ? 1 : 0);
+};
+const startU = (x) => halfUnit(x.start_date, x.start_half === 'PM' ? 'PM' : 'AM', false);
+const endU   = (x) => halfUnit(x.end_date,   x.end_half   === 'AM' ? 'AM' : 'PM', true);
+
+const iso = (d) => {
+  const x = new Date(d);
+  return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, ch =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+
+const applyTheme = () => {
+  document.body.classList.toggle('inv', store.get(KEY_THEME) === '1');
+};
+
+// --------------------------------------------------------------------------
+// Attivazione
+// --------------------------------------------------------------------------
+function schermataAttivazione(codice, errore) {
+  const app = document.getElementById('app');
+  if (!codice) {
+    app.innerHTML = `
+      <div class="center">
+        <h1>Progetto.io</h1>
+        <p>Per usare l'app apri il link di attivazione che ti ha inviato il responsabile.</p>
+        ${errore ? `<div class="banner err">${esc(errore)}</div>` : ''}
+      </div>`;
+    return;
+  }
+  app.innerHTML = `
+    <div class="center">
+      <h1>Attiva il dispositivo</h1>
+      <p>Questo telefono resterà collegato al tuo profilo. Non servirà una password.</p>
+      ${errore ? `<div class="banner err">${esc(errore)}</div>` : ''}
+      <button class="btn" id="go">Attiva</button>
+    </div>`;
+  document.getElementById('go').onclick = async (e) => {
+    e.target.disabled = true;
+    e.target.textContent = 'Attivazione…';
+    try {
+      const r = await fetch(API + '/tech/activate', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ code: codice, device_name: navigator.userAgent.slice(0,110) }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.message || 'Attivazione non riuscita');
+      store.set(KEY_TOKEN, d.token);
+      store.set(KEY_TECH, JSON.stringify(d.technician));
+      history.replaceState(null, '', location.pathname);  // toglie il codice dall'URL
+      avvia();
+    } catch (err) {
+      schermataAttivazione(codice, err.message);
+    }
+  };
+}
+
+// --------------------------------------------------------------------------
+// Agenda
+// --------------------------------------------------------------------------
+let periodo = 'week';
+let dati = null;
+
+async function caricaAgenda() {
+  const token = store.get(KEY_TOKEN);
+  const r = await fetch(API + '/tech/agenda', { headers: { 'X-Device-Token': token } });
+  if (r.status === 401) { store.del(KEY_TOKEN); store.del(KEY_TECH); throw new Error('revocato'); }
+  if (!r.ok) throw new Error('rete');
+  const d = await r.json();
+  store.set(KEY_CACHE, JSON.stringify({ at: Date.now(), d }));
+  return d;
+}
+
+function giorniDelPeriodo() {
+  const oggi = new Date(); oggi.setHours(0,0,0,0);
+  const n = periodo === 'today' ? 1 : periodo === 'week' ? 7 : 31;
+  return Array.from({length:n}, (_,i) => {
+    const d = new Date(oggi); d.setDate(d.getDate()+i); return d;
+  });
+}
+
+function render(offline) {
+  const app = document.getElementById('app');
+  const tech = JSON.parse(store.get(KEY_TECH) || '{}');
+  const giorni = giorniDelPeriodo();
+
+  let corpo = '';
+  let vuoto = true;
+
+  giorni.forEach(giorno => {
+    const u0 = halfUnit(iso(giorno), 'AM', false);
+    const u1 = halfUnit(iso(giorno), 'PM', true);
+
+    const att = (dati.activities || []).filter(a => startU(a) <= u1 && endU(a) >= u0);
+    const ass = (dati.absences  || []).filter(a => startU(a) <= u1 && endU(a) >= u0);
+    if (!att.length && !ass.length) return;
+    vuoto = false;
+
+    const isOggi = iso(giorno) === iso(new Date());
+    const etichetta = isOggi ? 'Oggi'
+      : GIORNI[giorno.getDay()] + ' ' + giorno.getDate() + ' ' + MESI[giorno.getMonth()];
+
+    corpo += `<div class="day${isOggi ? ' today' : ''}"><h2>${esc(etichetta)}</h2>`;
+
+    ass.forEach(a => {
+      corpo += `<div class="card abs">
+        <div class="act">🏖 ${esc(TIPI[a.type] || a.type)}</div>
+        ${a.note ? `<div class="prj">${esc(a.note)}</div>` : ''}
+      </div>`;
+    });
+
+    att.forEach(a => {
+      // Mezze giornate: si segnala solo quando non è una giornata intera
+      let quando = '';
+      if (iso(a.start_date) === iso(giorno) && a.start_half === 'PM') quando = 'dal pomeriggio';
+      else if (iso(a.end_date) === iso(giorno) && a.end_half === 'AM') quando = 'fino a mezzogiorno';
+
+      corpo += `<div class="card" style="border-left-color:${esc(a.project_color || '#555')}">
+        <div class="top">
+          <span class="code" style="background:${esc(a.project_color || '#555')}">${esc(a.project_code || '—')}</span>
+          <span class="act">${esc(a.name)}</span>
+        </div>
+        <div class="prj">${esc(a.project_name || '')}</div>
+        <div class="meta">
+          <span>${esc(new Date(a.start_date).toLocaleDateString('it-IT'))} → ${esc(new Date(a.end_date).toLocaleDateString('it-IT'))}</span>
+          ${quando ? `<span>${esc(quando)}</span>` : ''}
+          <span>${a.progress || 0}%</span>
+        </div>
+        ${a.mates && a.mates.length ? `<div class="mates">Con: ${
+          a.mates.map(m => `<span class="mate">${esc(m.name)}</span>`).join('')
+        }</div>` : ''}
+      </div>`;
+    });
+
+    corpo += '</div>';
+  });
+
+  if (vuoto) corpo = `<div class="empty">Nessun impegno in questo periodo.</div>`;
+
+  app.innerHTML = `
+    <header>
+      <span class="name">${esc(tech.name || 'Tecnico')}</span>
+      <button id="theme" title="Colori">◐</button>
+      <button id="reload" title="Aggiorna">↻</button>
+    </header>
+    <main>
+      ${offline ? `<div class="banner">Nessuna connessione: dati dell'ultimo aggiornamento.</div>` : ''}
+      <div class="tabs">
+        <button data-p="today" class="${periodo==='today'?'on':''}">Oggi</button>
+        <button data-p="week"  class="${periodo==='week' ?'on':''}">7 giorni</button>
+        <button data-p="month" class="${periodo==='month'?'on':''}">Mese</button>
+      </div>
+      ${corpo}
+    </main>`;
+
+  document.querySelectorAll('.tabs button').forEach(b => {
+    b.onclick = () => { periodo = b.dataset.p; render(offline); };
+  });
+  document.getElementById('theme').onclick = () => {
+    store.set(KEY_THEME, store.get(KEY_THEME) === '1' ? '0' : '1');
+    applyTheme();
+  };
+  document.getElementById('reload').onclick = () => avvia();
+}
+
+// --------------------------------------------------------------------------
+async function avvia() {
+  applyTheme();
+
+  const hash = location.hash.replace(/^#/, '');
+  if (!store.get(KEY_TOKEN)) return schermataAttivazione(hash || null);
+
+  // Si mostra subito la copia locale, poi si aggiorna: in cantiere la rete
+  // spesso non c'è, e un'app che resta bianca non serve a nulla.
+  const cache = store.get(KEY_CACHE);
+  if (cache) {
+    try { dati = JSON.parse(cache).d; render(true); } catch {}
+  } else {
+    document.getElementById('app').innerHTML = '<div class="center"><p>Caricamento…</p></div>';
+  }
+
+  try {
+    dati = await caricaAgenda();
+    render(false);
+  } catch (err) {
+    if (err.message === 'revocato') {
+      store.del(KEY_CACHE);
+      return schermataAttivazione(null, 'Accesso revocato. Chiedi un nuovo link di attivazione.');
+    }
+    if (!dati) {
+      document.getElementById('app').innerHTML =
+        '<div class="center"><h1>Nessuna connessione</h1><p>Riprova quando hai rete.</p></div>';
+    }
+  }
+}
+
+window.addEventListener('hashchange', avvia);
+avvia();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

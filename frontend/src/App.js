@@ -1,8 +1,60 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { LANGUAGES, LOCALES, makeT } from './i18n';
+import Reports from './Reports';
+import { halfUnit, actStartUnit, actEndUnit, actDurationDays } from './dateUtils';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
 import axios from 'axios';
 
 const API_URL = '/api';
+
+// Paesi EMEA raggruppati per area. Codici ISO 3166-1 alpha-2: sono ordinabili,
+// si convertono in bandierina senza librerie e restano validi per integrazioni future.
+const EMEA_COUNTRIES = [
+  { group: 'Europa occidentale', items: [
+    ['IT', 'Italia'], ['FR', 'Francia'], ['DE', 'Germania'], ['ES', 'Spagna'],
+    ['PT', 'Portogallo'], ['GB', 'Regno Unito'], ['IE', 'Irlanda'], ['NL', 'Paesi Bassi'],
+    ['BE', 'Belgio'], ['LU', 'Lussemburgo'], ['CH', 'Svizzera'], ['AT', 'Austria'],
+    ['MC', 'Monaco'], ['MT', 'Malta'], ['CY', 'Cipro'],
+  ]},
+  { group: 'Europa settentrionale', items: [
+    ['SE', 'Svezia'], ['NO', 'Norvegia'], ['DK', 'Danimarca'], ['FI', 'Finlandia'],
+    ['IS', 'Islanda'], ['EE', 'Estonia'], ['LV', 'Lettonia'], ['LT', 'Lituania'],
+  ]},
+  { group: 'Europa centro-orientale', items: [
+    ['PL', 'Polonia'], ['CZ', 'Rep. Ceca'], ['SK', 'Slovacchia'], ['HU', 'Ungheria'],
+    ['RO', 'Romania'], ['BG', 'Bulgaria'], ['SI', 'Slovenia'], ['HR', 'Croazia'],
+    ['RS', 'Serbia'], ['BA', 'Bosnia-Erzegovina'], ['ME', 'Montenegro'], ['MK', 'Macedonia del Nord'],
+    ['AL', 'Albania'], ['GR', 'Grecia'], ['UA', 'Ucraina'], ['MD', 'Moldavia'],
+    ['BY', 'Bielorussia'], ['RU', 'Russia'], ['TR', 'Turchia'],
+  ]},
+  { group: 'Medio Oriente', items: [
+    ['AE', 'Emirati Arabi Uniti'], ['SA', 'Arabia Saudita'], ['QA', 'Qatar'], ['KW', 'Kuwait'],
+    ['BH', 'Bahrein'], ['OM', 'Oman'], ['IL', 'Israele'], ['JO', 'Giordania'],
+    ['LB', 'Libano'], ['IQ', 'Iraq'], ['IR', 'Iran'], ['YE', 'Yemen'],
+  ]},
+  { group: 'Africa settentrionale', items: [
+    ['MA', 'Marocco'], ['DZ', 'Algeria'], ['TN', 'Tunisia'], ['LY', 'Libia'],
+    ['EG', 'Egitto'], ['SD', 'Sudan'],
+  ]},
+  { group: 'Africa occidentale', items: [
+    ['NG', 'Nigeria'], ['GH', 'Ghana'], ['CI', "Costa d'Avorio"], ['SN', 'Senegal'],
+    ['ML', 'Mali'], ['BF', 'Burkina Faso'], ['GN', 'Guinea'], ['CM', 'Camerun'],
+  ]},
+  { group: 'Africa orientale', items: [
+    ['KE', 'Kenya'], ['ET', 'Etiopia'], ['TZ', 'Tanzania'], ['UG', 'Uganda'],
+    ['RW', 'Ruanda'], ['MZ', 'Mozambico'], ['MU', 'Mauritius'], ['MG', 'Madagascar'],
+  ]},
+  { group: 'Africa australe', items: [
+    ['ZA', 'Sudafrica'], ['AO', 'Angola'], ['ZM', 'Zambia'], ['ZW', 'Zimbabwe'],
+    ['BW', 'Botswana'], ['NA', 'Namibia'],
+  ]},
+];
+
+// Mappa codice -> nome, per mostrare l'etichetta estesa nei filtri
+const COUNTRY_NAMES = EMEA_COUNTRIES.reduce((acc, g) => {
+  g.items.forEach(([code, name]) => { acc[code] = name; });
+  return acc;
+}, {});
 
 const App = () => {
   const [user, setUser] = useState(null);
@@ -15,6 +67,18 @@ const App = () => {
   const [projects, setProjects] = useState([]);
   const [activities, setActivities] = useState([]);
   const [technicians, setTechnicians] = useState([]);
+  const [absences, setAbsences] = useState([]);
+  const [showAbsenceModal, setShowAbsenceModal] = useState(false);
+  const [editingAbsence, setEditingAbsence] = useState(null);
+  const [absenceTech, setAbsenceTech] = useState(null);
+  const [showDeviceModal, setShowDeviceModal] = useState(false);
+  const [deviceTech, setDeviceTech] = useState(null);
+  const [devices, setDevices] = useState([]);
+  const [newInvite, setNewInvite] = useState(null);
+  const [auditRows, setAuditRows] = useState([]);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditPage, setAuditPage] = useState(0);
+  const [restoring, setRestoring] = useState(false);
   const [users, setUsers] = useState([]);
   const [selectedActivity, setSelectedActivity] = useState(null);
   const [showActivityModal, setShowActivityModal] = useState(false);
@@ -30,11 +94,83 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [groupBy, setGroupBy] = useState('project');
   const [expandedTechs, setExpandedTechs] = useState([]);
+  const [filterCountries, setFilterCountries] = useState([]);
+  const [filterText, setFilterText] = useState('');
+  const [onlyConflicts, setOnlyConflicts] = useState(false);
+  const [filterTechIds, setFilterTechIds] = useState([]);
+  const [expandedConflictTechs, setExpandedConflictTechs] = useState([]);
+  const [inverted, setInverted] = useState(() => {
+    try { return localStorage.getItem('inverted') === '1'; } catch { return false; }
+  });
+  // Il registro si popola entrando nella pagina: un pulsante "carica" accanto
+  // a "ripristina backup" era ambiguo, sembrava riferirsi a un file.
+  useEffect(() => {
+    if (currentView === 'system' && user?.role === 'admin') fetchAudit(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentView, user]);
+
+  useEffect(() => {
+    try { localStorage.setItem('inverted', inverted ? '1' : '0'); } catch {}
+    // Le variabili vivono su :root cosi' valgono anche per gli stili inline,
+    // che in React accettano var() senza problemi.
+    const r = document.documentElement.style;
+    const th = inverted
+      ? { bg:'#121212', fg:'#f5f5f5', surface:'#1c1c1c', surface2:'#252525',
+          border:'#3a3a3a', muted:'#9e9e9e', barBg:'#f5f5f5', barFg:'#121212',
+          rowAlt:'#1a1a1a', shadow:'rgba(0,0,0,0.5)',
+          accent:'#f5f5f5', accentFg:'#121212' }
+      : { bg:'#f2f2f2', fg:'#121212', surface:'#ffffff', surface2:'#f7f7f7',
+          border:'#d9d9d9', muted:'#6b6b6b', barBg:'#000000', barFg:'#ffffff',
+          rowAlt:'#fafafa', shadow:'rgba(0,0,0,0.12)',
+          accent:'#000000', accentFg:'#ffffff' };
+    Object.entries(th).forEach(([k, v]) => r.setProperty('--' + k, v));
+    document.body.style.backgroundColor = th.bg;
+    document.body.style.color = th.fg;
+  }, [inverted]);
+
+  const [lang, setLang] = useState(() => {
+    try { return localStorage.getItem('lang') || 'it'; } catch { return 'it'; }
+  });
+  const t = useMemo(() => makeT(lang), [lang]);
+  const locale = LOCALES[lang] || 'it-IT';
+  useEffect(() => {
+    try { localStorage.setItem('lang', lang); } catch {}
+  }, [lang]);
+  const [conflictSearch, setConflictSearch] = useState('');
+
+  // L'altezza del Gantt era fissata a calc(100vh - 240px): un valore stimato che
+  // non teneva conto della barra filtri, cosi' il contenitore sforava lo schermo
+  // e la barra di scorrimento orizzontale finiva sotto il bordo visibile.
+  // Qui la posizione reale viene misurata e l'altezza adattata di conseguenza.
+  const ganttRef = useRef(null);
+  const [ganttHeight, setGanttHeight] = useState(500);
+
+  useEffect(() => {
+    const measure = () => {
+      if (!ganttRef.current) return;
+      const top = ganttRef.current.getBoundingClientRect().top;
+      const reserved = 24; // solo il margine inferiore: legenda e filtri
+                           // stanno nel flusso e occupano l'altezza che serve
+      const h = Math.max(280, window.innerHeight - top - reserved);
+      setGanttHeight(prev => Math.abs(prev - h) > 2 ? h : prev);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  });
+
+  const [activityPage, setActivityPage] = useState(0);
+  const [expandedActProjects, setExpandedActProjects] = useState([]);
+  const [activitySearch, setActivitySearch] = useState('');
+  const [activityCountries, setActivityCountries] = useState([]);
+  const PROJECTS_PER_PAGE = 25;
   const [formStart, setFormStart] = useState('');
   const [formEnd, setFormEnd] = useState('');
+  const [formStartHalf, setFormStartHalf] = useState('AM');
+  const [formEndHalf, setFormEndHalf] = useState('PM');
   const [showUserModal, setShowUserModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
-  const [newUser, setNewUser] = useState({ email: '', password: '', name: '', role: 'viewer', phone: '' });
+  const [newUser, setNewUser] = useState({ email: '', password: '', name: '', role: 'viewer', phone: '', countries: [] });
 
   useEffect(() => {
     if (token) {
@@ -47,6 +183,7 @@ const App = () => {
     if (user) {
       fetchProjects();
       fetchTechnicians();
+      fetchAbsences();
       fetchActivities();
       if (user.role === 'admin') {
         fetchUsers();
@@ -119,6 +256,136 @@ const App = () => {
     }
   };
 
+  const fetchAudit = async (page = 0) => {
+    try {
+      const res = await axios.get(`${API_URL}/audit`, { params: { limit: 50, offset: page * 50 } });
+      setAuditRows(res.data.rows);
+      setAuditTotal(res.data.total);
+      setAuditPage(page);
+    } catch (error) {
+      console.error('Error fetching audit:', error);
+    }
+  };
+
+  const handleBackup = async () => {
+    try {
+      const res = await axios.get(`${API_URL}/admin/backup`);
+      const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `progetto-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante il backup');
+    }
+  };
+
+  const handleRestore = async (file) => {
+    if (!file) return;
+    // Doppia conferma: il ripristino sostituisce tutto, e non basta un clic
+    // distratto per farlo.
+    if (!window.confirm(t('restoreWarning'))) return;
+    const typed = window.prompt(t('restoreType'));
+    if (typed !== 'RESTORE') {
+      if (typed !== null) alert(t('restoreAborted'));
+      return;
+    }
+    setRestoring(true);
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const res = await axios.post(`${API_URL}/admin/restore`, payload);
+      alert(`${t('restoreDone')} (${res.data.rows})`);
+      fetchProjects(); fetchActivities(); fetchTechnicians(); fetchAbsences();
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante il ripristino');
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const handleDuplicateProject = async (project) => {
+    const shift = window.prompt(t('shiftDaysPrompt'), '0');
+    if (shift === null) return;
+    try {
+      const res = await axios.post(`${API_URL}/projects/${project.id}/duplicate`, {
+        shift_days: parseInt(shift) || 0,
+      });
+      fetchProjects(); fetchActivities();
+      alert(`${t('duplicated')}: ${res.data.project.code} (${res.data.activities})`);
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante la duplicazione');
+    }
+  };
+
+  const openDevices = async (tech) => {
+    setDeviceTech(tech);
+    setNewInvite(null);
+    setShowDeviceModal(true);
+    try {
+      const res = await axios.get(`${API_URL}/technicians/${tech.id}/devices`);
+      setDevices(res.data);
+    } catch (error) {
+      setDevices([]);
+    }
+  };
+
+  const createInvite = async () => {
+    try {
+      const res = await axios.post(`${API_URL}/technicians/${deviceTech.id}/invite`);
+      // Il codice arriva in chiaro solo qui: sul server resta l'hash
+      setNewInvite(res.data);
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante la creazione dell\'invito');
+    }
+  };
+
+  const revokeDevice = async (id) => {
+    if (!window.confirm(t('revokeConfirm'))) return;
+    try {
+      await axios.delete(`${API_URL}/tech-devices/${id}`);
+      const res = await axios.get(`${API_URL}/technicians/${deviceTech.id}/devices`);
+      setDevices(res.data);
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante la revoca');
+    }
+  };
+
+  const fetchAbsences = async () => {
+    try {
+      const res = await axios.get(`${API_URL}/absences`);
+      setAbsences(res.data);
+    } catch (error) {
+      console.error('Error fetching absences:', error);
+    }
+  };
+
+  const handleSaveAbsence = async (data) => {
+    try {
+      if (editingAbsence?.id) await axios.put(`${API_URL}/absences/${editingAbsence.id}`, data);
+      else await axios.post(`${API_URL}/absences`, data);
+      fetchAbsences();
+      setShowAbsenceModal(false);
+      setEditingAbsence(null);
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante il salvataggio');
+    }
+  };
+
+  const handleDeleteAbsence = async (id) => {
+    if (!window.confirm(t('confirmDelete'))) return;
+    try {
+      await axios.delete(`${API_URL}/absences/${id}`);
+      fetchAbsences();
+    } catch (error) {
+      alert(error.response?.data?.message || 'Errore durante l\'eliminazione');
+    }
+  };
+
   const fetchUsers = async () => {
     try {
       const response = await axios.get(`${API_URL}/users`);
@@ -157,6 +424,20 @@ const App = () => {
     setProjects(projects.map(p => 
       p.id === projectId ? { ...p, expanded: !p.expanded } : p
     ));
+  };
+
+  // Agisce solo sui progetti che superano i filtri attivi: se e' selezionata
+  // una sola nazione, apre e chiude soltanto quelli.
+  const toggleAllVisibleProjects = () => {
+    const ids = new Set(visibleProjects.map(p => p.id));
+    const allOpen = visibleProjects.length > 0 && visibleProjects.every(p => p.expanded);
+    setProjects(projects.map(p => ids.has(p.id) ? { ...p, expanded: !allOpen } : p));
+  };
+
+  const toggleAllVisibleTechs = () => {
+    const ids = visibleTechnicians.map(t => t.id);
+    const allOpen = ids.length > 0 && ids.every(id => expandedTechs.includes(id));
+    setExpandedTechs(allOpen ? [] : ids);
   };
 
 
@@ -261,21 +542,27 @@ const handleSaveActivity = async (activityData) => {
         const userData = {
           name: editingUser.name,
           email: editingUser.email,
-          phone: editingUser.phone,
-          role: editingUser.role
+          phone: editingUser.phone || null,
+          role: editingUser.role,
+          // Le aree valgono solo per gli editor: cambiando ruolo si azzerano,
+          // altrimenti resterebbero permessi invisibili su un utente admin o viewer.
+          countries: editingUser.role === 'editor' ? (editingUser.countries || []) : []
         };
         await axios.put(`${API_URL}/users/${editingUser.id}`, userData);
       } else {
-        // Crea nuovo utente
-        await axios.post(`${API_URL}/users`, newUser);
+        await axios.post(`${API_URL}/users`, {
+          ...newUser,
+          phone: newUser.phone || null,
+          countries: newUser.role === 'editor' ? newUser.countries : []
+        });
       }
       fetchUsers();
       setShowUserModal(false);
       setEditingUser(null);
-      setNewUser({ email: '', password: '', name: '', role: 'viewer', phone: '' });
+      setNewUser({ email: '', password: '', name: '', role: 'viewer', phone: '', countries: [] });
     } catch (error) {
       console.error('Error saving user:', error);
-      alert('Errore durante il salvataggio dell\'utente');
+      alert(error.response?.data?.message || 'Errore durante il salvataggio dell\'utente');
     }
   };
 
@@ -290,52 +577,62 @@ const handleSaveActivity = async (activityData) => {
     }
   };
   
-  const detectConflicts = () => {
+  // Un conflitto = un PERIODO di sovrapposizione per tecnico, con tutte le attivita'
+  // coinvolte. La versione precedente creava una scheda per ogni singolo giorno,
+  // producendo migliaia di righe quasi identiche.
+  const detectedConflicts = useMemo(() => {
     const conflicts = [];
-    const technicianActivities = {};
+    const byTech = new Map();
 
-    activities.forEach(activity => {
-      if (!activity.technicians || activity.technicians.length === 0) return;
-
-      const startDate = new Date(activity.start_date);
-      const endDate = new Date(activity.end_date);
-
-      activity.technicians.forEach(tech => {
-        if (!technicianActivities[tech.id]) {
-          technicianActivities[tech.id] = { name: tech.name, conflicts: [] };
-        }
-
-        for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-          const dateStr = d.toISOString().split('T')[0];
-          if (!technicianActivities[tech.id][dateStr]) {
-            technicianActivities[tech.id][dateStr] = [];
-          }
-          technicianActivities[tech.id][dateStr].push(activity);
-        }
+    activities.forEach(a => {
+      (a.technicians || []).forEach(t => {
+        if (!byTech.has(t.id)) byTech.set(t.id, { name: t.name, list: [] });
+        byTech.get(t.id).list.push(a);
       });
     });
 
-    Object.keys(technicianActivities).forEach(techId => {
-      const tech = technicianActivities[techId];
-      Object.keys(tech).forEach(date => {
-        if (date === 'name' || date === 'conflicts') return;
-        const activitiesOnDate = tech[date];
-        if (activitiesOnDate.length > 1) {
-          conflicts.push({
-            technicianId: techId,
-            technicianName: tech.name,
-            date: date,
-            activities: activitiesOnDate
-          });
+    byTech.forEach((entry, techId) => {
+      const sorted = [...entry.list].sort((x, y) => actStartUnit(x) - actStartUnit(y));
+      if (sorted.length < 2) return;
+
+      let cluster = [sorted[0]];
+      let maxEnd = actEndUnit(sorted[0]);
+
+      const flush = () => {
+        if (cluster.length < 2) return;
+        const starts = cluster.map(a => new Date(a.start_date));
+        const ends = cluster.map(a => new Date(a.end_date));
+        conflicts.push({
+          technicianId: techId,
+          technicianName: entry.name,
+          startDate: new Date(Math.max(...starts)).toISOString().split('T')[0],
+          endDate: new Date(Math.min(...ends)).toISOString().split('T')[0],
+          periodStart: new Date(Math.min(...starts)).toISOString().split('T')[0],
+          periodEnd: new Date(Math.max(...ends)).toISOString().split('T')[0],
+          activities: cluster,
+        });
+      };
+
+      for (let i = 1; i < sorted.length; i++) {
+        const cur = sorted[i];
+        if (actStartUnit(cur) <= maxEnd) {
+          cluster.push(cur);
+          if (actEndUnit(cur) > maxEnd) maxEnd = actEndUnit(cur);
+        } else {
+          flush();
+          cluster = [cur];
+          maxEnd = actEndUnit(cur);
         }
-      });
+      }
+      flush();
     });
 
     return conflicts;
-  };
+  }, [activities]);
+
 
   const formatDate = (date) => {
-    return date.toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit' });
+    return date.toLocaleDateString(locale, { day: '2-digit', month: '2-digit' });
   };
 
   const formatDateForInput = (date) => {
@@ -347,7 +644,7 @@ const handleSaveActivity = async (activityData) => {
   };
 
   const formatMonthYear = (date) => {
-    return date.toLocaleDateString('it-IT', { month: 'long', year: 'numeric' });
+    return date.toLocaleDateString(locale, { month: 'long', year: 'numeric' });
   };
 
   // ---- Gestione date attività ----
@@ -372,13 +669,17 @@ const handleSaveActivity = async (activityData) => {
     setFormStart(value);
   };
 
-  const dateError = Boolean(formStart && formEnd && new Date(formEnd) < new Date(formStart));
-  const durationDays = (formStart && formEnd && !dateError) ? daysBetween(formStart, formEnd) + 1 : null;
+  const startUnit = formStart ? halfUnit(formStart, formStartHalf, false) : null;
+  const endUnit   = formEnd ? halfUnit(formEnd, formEndHalf, true) : null;
+  const dateError = Boolean(formStart && formEnd && endUnit < startUnit);
+  const durationDays = (formStart && formEnd && !dateError) ? (endUnit - startUnit + 1) / 2 : null;
 
   useEffect(() => {
     if (showActivityModal || showEditModal) {
       setFormStart(editingActivity?.start_date ? formatDateForInput(editingActivity.start_date) : '');
       setFormEnd(editingActivity?.end_date ? formatDateForInput(editingActivity.end_date) : '');
+      setFormStartHalf(editingActivity?.start_half === 'PM' ? 'PM' : 'AM');
+      setFormEndHalf(editingActivity?.end_half === 'AM' ? 'AM' : 'PM');
     }
   }, [showActivityModal, showEditModal, editingActivity]);
 
@@ -402,6 +703,156 @@ const handleSaveActivity = async (activityData) => {
   return techActivities.length > 1;
 };
 
+  // Indici per evitare scansioni annidate: senza questi, ogni progetto e ogni
+  // tecnico riscorrerebbe l'intero elenco attivita' a ogni render (O(n*m)).
+  const activitiesByProject = useMemo(() => {
+    const m = new Map();
+    activities.forEach(a => {
+      if (!m.has(a.project_id)) m.set(a.project_id, []);
+      m.get(a.project_id).push(a);
+    });
+    return m;
+  }, [activities]);
+
+  const activitiesByTech = useMemo(() => {
+    const m = new Map();
+    activities.forEach(a => {
+      (a.technicians || []).forEach(t => {
+        if (!m.has(t.id)) m.set(t.id, []);
+        m.get(t.id).push(a);
+      });
+    });
+    return m;
+  }, [activities]);
+
+  // Conflitti precalcolati una volta sola: con migliaia di attivita' il confronto
+  // a coppie a ogni render sarebbe insostenibile. Il calcolo resta GLOBALE, mai
+  // filtrato: un tecnico impegnato in Spagna deve risultare occupato anche
+  // guardando solo l'Italia.
+  const conflictingActivityIds = useMemo(() => {
+    const byTech = new Map();
+    activities.forEach(a => {
+      (a.technicians || []).forEach(t => {
+        if (!byTech.has(t.id)) byTech.set(t.id, []);
+        byTech.get(t.id).push(a);
+      });
+    });
+    const ids = new Set();
+    byTech.forEach(list => {
+      const sorted = [...list].sort((x, y) => actStartUnit(x) - actStartUnit(y));
+      if (sorted.length < 2) return;
+      let maxItem = sorted[0];
+      let maxEnd = actEndUnit(sorted[0]);
+      for (let i = 1; i < sorted.length; i++) {
+        const cur = sorted[i];
+        if (actStartUnit(cur) <= maxEnd) {
+          ids.add(cur.id);
+          ids.add(maxItem.id);
+        }
+        if (actEndUnit(cur) > maxEnd) {
+          maxEnd = actEndUnit(cur);
+          maxItem = cur;
+        }
+      }
+    });
+    return ids;
+  }, [activities]);
+
+  const projectsById = useMemo(() => {
+    const m = new Map();
+    projects.forEach(p => m.set(p.id, p));
+    return m;
+  }, [projects]);
+
+  // Un'attivita' assegnata a un tecnico durante una sua assenza e' un conflitto,
+  // ma di natura diversa dalla doppia assegnazione: va segnalato, mai impedito.
+  // Capita di richiamare qualcuno dalle ferie.
+  const absenceConflicts = useMemo(() => {
+    const m = new Map();
+    if (!absences.length) return m;
+    const byTech = new Map();
+    absences.forEach(x => {
+      if (!byTech.has(x.technician_id)) byTech.set(x.technician_id, []);
+      byTech.get(x.technician_id).push(x);
+    });
+    activities.forEach(a => {
+      const s = actStartUnit(a), e = actEndUnit(a);
+      (a.technicians || []).forEach(tc => {
+        (byTech.get(tc.id) || []).forEach(ab => {
+          if (actStartUnit(ab) <= e && actEndUnit(ab) >= s) {
+            if (!m.has(a.id)) m.set(a.id, []);
+            m.get(a.id).push({ tech: tc.name, type: ab.type, from: ab.start_date, to: ab.end_date });
+          }
+        });
+      });
+    });
+    return m;
+  }, [activities, absences]);
+
+  // Attivita' che ricadono su un'assenza del tecnico, raggruppate per persona
+  const absenceIssues = useMemo(() => {
+    const byTech = new Map();
+    absenceConflicts.forEach((list, actId) => {
+      const act = activities.find(a => a.id === actId);
+      if (!act) return;
+      list.forEach(x => {
+        if (!byTech.has(x.tech)) byTech.set(x.tech, []);
+        byTech.get(x.tech).push({ activity: act, absence: x });
+      });
+    });
+    return byTech;
+  }, [absenceConflicts, activities]);
+
+  const availableCountries = useMemo(
+    () => [...new Set(projects.map(p => p.country).filter(Boolean))].sort(),
+    [projects]
+  );
+
+  const countryFlag = (cc) => {
+    if (!cc || cc.length !== 2) return '';
+    return String.fromCodePoint(...[...cc.toUpperCase()].map(ch => 127397 + ch.charCodeAt(0)));
+  };
+
+  const visibleProjects = useMemo(() => {
+    const q = filterText.trim().toLowerCase();
+    const techSet = new Set(filterTechIds);
+    return projects.filter(p => {
+      if (filterCountries.length && !filterCountries.includes(p.country)) return false;
+      if (q && !`${p.code} ${p.name}`.toLowerCase().includes(q)) return false;
+      const acts = activitiesByProject.get(p.id) || [];
+      if (techSet.size && !acts.some(a => (a.technicians || []).some(t => techSet.has(t.id)))) return false;
+      if (onlyConflicts && !acts.some(a => conflictingActivityIds.has(a.id))) return false;
+      return true;
+    });
+  }, [projects, activitiesByProject, filterCountries, filterText, filterTechIds, onlyConflicts, conflictingActivityIds]);
+
+  const visibleTechnicians = useMemo(() => {
+    const projIds = new Set(
+      projects.filter(p => !filterCountries.length || filterCountries.includes(p.country)).map(p => p.id)
+    );
+    const q = filterText.trim().toLowerCase();
+    const techSet = new Set(filterTechIds);
+    return technicians.filter(t => {
+      if (techSet.size && !techSet.has(t.id)) return false;
+      const acts = (activitiesByTech.get(t.id) || []).filter(a => projIds.has(a.project_id));
+      if (acts.length === 0) return false;
+      if (q && !t.name.toLowerCase().includes(q)) return false;
+      if (onlyConflicts && !acts.some(a => conflictingActivityIds.has(a.id))) return false;
+      return true;
+    });
+  }, [technicians, projects, activitiesByTech, filterCountries, filterText, filterTechIds, onlyConflicts, conflictingActivityIds]);
+
+  const toggleCountry = (cc) => {
+    setFilterCountries(prev => prev.includes(cc) ? prev.filter(x => x !== cc) : [...prev, cc]);
+  };
+
+  const resetFilters = () => {
+    setFilterCountries([]);
+    setFilterText('');
+    setOnlyConflicts(false);
+    setFilterTechIds([]);
+  };
+
   const toggleTech = (techId) => {
     setExpandedTechs(prev =>
       prev.includes(techId) ? prev.filter(id => id !== techId) : [...prev, techId]
@@ -417,11 +868,14 @@ const handleSaveActivity = async (activityData) => {
 
     // Sfondo griglia disegnato in CSS: 1 nodo invece di N celle per riga
     const gridBg = {
-      backgroundImage: `repeating-linear-gradient(to right, #f0f0f0 0 1px, transparent 1px ${DAY_W}px)`,
+      backgroundImage: `repeating-linear-gradient(to right, var(--border) 0 1px, transparent 1px ${DAY_W}px)`,
       backgroundSize: `${DAY_W}px 100%`,
     };
 
     // Posizione della barra dell'attivita' nel periodo visibile
+    // Posizione in MEZZE CELLE: chi lavora solo il pomeriggio parte a meta' cella,
+    // chi finisce a mezzogiorno si ferma a meta'.
+    const HALF = DAY_W / 2;
     const barPos = (activity) => {
       if (!activity.start_date || !activity.end_date) return null;
       const first = new Date(dates[0]);                     first.setHours(0,0,0,0);
@@ -431,22 +885,34 @@ const handleSaveActivity = async (activityData) => {
       if (e < first || s > last) return null;
 
       const dayMs = 86400000;
-      const startIdx = Math.max(0, Math.round((s - first) / dayMs));
-      const endIdx   = Math.min(dates.length - 1, Math.round((e - first) / dayMs));
-      return { left: startIdx * DAY_W, width: (endIdx - startIdx + 1) * DAY_W };
+      const rawStart = Math.round((s - first) / dayMs);
+      const rawEnd   = Math.round((e - first) / dayMs);
+
+      // Bordi in mezze celle; il ritaglio ai margini del periodo visibile
+      // avviene dopo, per non perdere la mezza giornata sui bordi interni.
+      let left  = rawStart * DAY_W + (activity.start_half === 'PM' ? HALF : 0);
+      let right = rawEnd   * DAY_W + (activity.end_half === 'AM' ? HALF : DAY_W);
+
+      const maxRight = dates.length * DAY_W;
+      if (left < 0) left = 0;
+      if (right > maxRight) right = maxRight;
+      if (right <= left) return null;
+
+      return { left, width: right - left };
     };
 
     // Giorni occupati nel periodo visibile (indicatore di carico)
+    // Conta in mezze giornate e restituisce i giorni (puo' essere 3,5)
     const loadDays = (acts) => {
       const busy = new Set();
       acts.forEach(a => {
         const p = barPos(a);
         if (!p) return;
-        const from = p.left / DAY_W;
-        const to   = from + p.width / DAY_W;
+        const from = Math.round(p.left / HALF);
+        const to   = Math.round((p.left + p.width) / HALF);
         for (let i = from; i < to; i++) busy.add(i);
       });
-      return busy.size;
+      return busy.size / 2;
     };
 
     const isToday = (d) => new Date().toDateString() === d.toDateString();
@@ -461,7 +927,7 @@ const handleSaveActivity = async (activityData) => {
           padding: indent ? '0 8px 0 28px' : '0 8px',
           display: 'flex', flexDirection: 'column', justifyContent: 'center',
           backgroundColor: bg,
-          borderRight: '2px solid #e5e7eb',
+          borderRight: '2px solid var(--border)',
           cursor: onClick ? 'pointer' : 'default',
           overflow: 'hidden',
         }}>
@@ -470,15 +936,19 @@ const handleSaveActivity = async (activityData) => {
     );
 
     // ---- Riga attivita' (usata da entrambe le viste) ----
-    const ActivityRow = ({ activity, label, sub, color }) => {
+    const ActivityRow = ({ activity, label, sub, color, barText }) => {
       const pos = barPos(activity);
       const techs = activity.technicians || [];
-      const conflict = techs.some(t => getTechnicianConflicts(t.id, new Date(activity.start_date)));
+      // Usa il set precalcolato: getTechnicianConflicts riscansionava tutte le attivita'
+      // per ogni barra, e controllava solo il primo giorno invece dell'intero periodo.
+      const overlap = conflictingActivityIds.has(activity.id);
+      const onLeave = absenceConflicts.has(activity.id);
+      const conflict = overlap || onLeave;
       return (
-        <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid #f0f0f0', backgroundColor: '#fafafa' }}>
-          <LeftCell bg="#fafafa" indent>
+        <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid var(--border)', backgroundColor: 'var(--rowAlt)' }}>
+          <LeftCell bg="var(--rowAlt)" indent>
             <div style={{ fontSize: 13, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{label}</div>
-            <div style={{ fontSize: 11, color: '#6b7280', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{sub}</div>
+            <div style={{ fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{sub}</div>
           </LeftCell>
           <div style={{ width: gridW, minWidth: gridW, position: 'relative', ...gridBg }}>
             {pos && (
@@ -488,18 +958,32 @@ const handleSaveActivity = async (activityData) => {
                   setSelectedTechnicians(techs.map(t => t.id));
                   setShowEditModal(true);
                 }}
-                title={`${activity.name} — ${activity.start_date} → ${activity.end_date}`}
+                title={`${onLeave ? '⚠ ' + t('duringAbsence') + ': ' + absenceConflicts.get(activity.id).map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${activity.name} — ${activity.start_date}${activity.start_half === 'PM' ? ' (' + t('afternoon') + ')' : ''} → ${activity.end_date}${activity.end_half === 'AM' ? ' (' + t('morning') + ')' : ''} — ${actDurationDays(activity)} ${t('calendarDays')}`}
                 style={{
                   position: 'absolute', top: 8, height: ROW_H - 16,
                   left: pos.left, width: pos.width,
-                  backgroundColor: conflict ? '#ef4444' : (color || '#3b82f6'),
+                  // Il conflitto non usa piu' il rosso pieno: era indistinguibile
+                  // da un tecnico che ha scelto il rosso come proprio colore.
+                  // Striature diagonali e bordo marcato funzionano con qualsiasi
+                  // colore e restano leggibili anche a chi non distingue i rossi.
+                  backgroundColor: color || '#555555',
+                  backgroundImage: conflict
+                    ? 'repeating-linear-gradient(45deg, rgba(0,0,0,0.55) 0 5px, rgba(255,255,255,0.30) 5px 10px)'
+                    : undefined,
                   borderRadius: 4, cursor: 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   fontSize: 12, color: 'white', fontWeight: 500,
-                  boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                  border: conflict ? '2px solid #ef4444' : '1px solid var(--border)',
+                  boxSizing: 'border-box',
                   overflow: 'hidden', whiteSpace: 'nowrap',
                 }}>
-                {activity.progress != null ? `${activity.progress}%` : ''}
+                <span style={{
+                  overflow: 'hidden', textOverflow: 'ellipsis', padding: '0 6px',
+                  textShadow: conflict ? '0 1px 3px rgba(0,0,0,0.9)' : undefined,
+                  position: 'relative',
+                }}>
+                  {conflict ? '⚠ ' : ''}{barText || (activity.progress != null ? `${activity.progress}%` : '')}
+                </span>
               </div>
             )}
           </div>
@@ -508,15 +992,127 @@ const handleSaveActivity = async (activityData) => {
     };
 
     return (
-      <div>
+      <div ref={ganttRef} style={{
+        height: ganttHeight,
+        display: 'flex',
+        flexDirection: 'column',
+        minHeight: 0,
+      }}>
+        {/* Barra filtri */}
+        <div style={{
+          display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center',
+          padding: '10px 12px', marginBottom: 12,
+          backgroundColor: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8,
+        }}>
+          {/* Nazioni */}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, color: 'var(--muted)', fontWeight: 600 }}>{t('country')}:</span>
+            {availableCountries.map(cc => {
+              const on = filterCountries.includes(cc);
+              return (
+                <button key={cc} onClick={() => toggleCountry(cc)} title={COUNTRY_NAMES[cc] || cc}
+                  style={{
+                    padding: '4px 10px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                    border: on ? '1px solid var(--accent)' : '1px solid var(--border)',
+                    backgroundColor: on ? 'var(--accent)' : 'var(--surface)',
+                    color: on ? 'var(--accentFg)' : 'var(--fg)',
+                  }}>
+                  {countryFlag(cc)} {cc}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Ricerca */}
+          <input
+            type="text"
+            value={filterText}
+            onChange={(e) => setFilterText(e.target.value)}
+            placeholder={groupBy === 'project' ? t('searchProject') : t('searchTechnician')}
+            style={{
+              padding: '5px 10px', fontSize: 13, minWidth: 190,
+              border: '1px solid var(--border)', borderRadius: 5,
+              backgroundColor: 'var(--surface)', color: 'var(--fg)',
+            }}
+          />
+
+          {/* Tecnici */}
+          <select
+            value=""
+            onChange={(e) => {
+              const id = parseInt(e.target.value);
+              if (id && !filterTechIds.includes(id)) setFilterTechIds([...filterTechIds, id]);
+            }}
+            style={{ padding: '5px 8px', fontSize: 13, border: '1px solid var(--border)', borderRadius: 5, maxWidth: 170, backgroundColor: 'var(--surface)', color: 'var(--fg)' }}
+          >
+            <option value="" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('filterTechnician')}</option>
+            {technicians
+              .filter(t => !filterTechIds.includes(t.id))
+              .map(t => <option key={t.id} value={t.id} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t.name}</option>)}
+          </select>
+
+          {filterTechIds.map(id => {
+            const tech = technicians.find(x => x.id === id);
+            if (!tech) return null;
+            return (
+              <span key={id}
+                onClick={() => setFilterTechIds(filterTechIds.filter(x => x !== id))}
+                title={t('clearFilters')}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '3px 8px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                  backgroundColor: tech.color || '#555555', color: 'white',
+                }}>
+                {tech.name} <strong>×</strong>
+              </span>
+            );
+          })}
+
+          {/* Solo conflitti */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+            <input type="checkbox" checked={onlyConflicts} onChange={(e) => setOnlyConflicts(e.target.checked)} />
+            {t('onlyConflicts')}
+          </label>
+
+          {/* Espandi / chiudi tutto */}
+          <button
+            onClick={groupBy === 'project' ? toggleAllVisibleProjects : toggleAllVisibleTechs}
+            style={{
+              padding: '5px 12px', fontSize: 12, cursor: 'pointer',
+              border: '1px solid var(--border)', borderRadius: 5,
+              backgroundColor: 'var(--surface)', color: 'var(--fg)', whiteSpace: 'nowrap',
+            }}>
+            {(groupBy === 'project'
+              ? (visibleProjects.length > 0 && visibleProjects.every(p => p.expanded))
+              : (visibleTechnicians.length > 0 && visibleTechnicians.every(x => expandedTechs.includes(x.id)))
+            ) ? `▾ ${t('collapseAll')}` : `▸ ${t('expandAll')}`}
+          </button>
+
+          {/* Contatore + reset */}
+          <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 'auto' }}>
+            {groupBy === 'project'
+              ? `${visibleProjects.length} ${t('projectsOf')} ${projects.length}`
+              : `${visibleTechnicians.length} ${t('techniciansOf')} ${technicians.length}`}
+          </span>
+          {(filterCountries.length > 0 || filterText || onlyConflicts) && (
+            <button onClick={resetFilters}
+              style={{
+                padding: '4px 10px', fontSize: 12, cursor: 'pointer',
+                border: '1px solid var(--border)', borderRadius: 5, backgroundColor: 'var(--surface)', color: 'var(--fg)',
+              }}>
+              {t('clearFilters')}
+            </button>
+          )}
+        </div>
+
         {/* Toggle raggruppamento */}
         <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-          {[['project', 'Per Progetto'], ['technician', 'Per Tecnico']].map(([key, label]) => (
+          {[['project', t('byProject')], ['technician', t('byTechnician')]].map(([key, label]) => (
             <button key={key} onClick={() => setGroupBy(key)}
               style={{
                 padding: '6px 14px', borderRadius: 5, border: 'none', cursor: 'pointer', fontSize: 13,
-                backgroundColor: groupBy === key ? '#667eea' : '#e5e7eb',
-                color: groupBy === key ? 'white' : '#333',
+                backgroundColor: groupBy === key ? 'var(--accent)' : 'var(--surface2)',
+                color: groupBy === key ? 'var(--accentFg)' : 'var(--fg)',
               }}>
               {label}
             </button>
@@ -526,8 +1122,9 @@ const handleSaveActivity = async (activityData) => {
         {/* UN SOLO contenitore scorrevole: la colonna sinistra e' sticky, non puo' sfasarsi */}
         <div style={{
           overflow: 'auto',
-          height: 'calc(100vh - 240px)',
-          border: '1px solid #e5e7eb',
+          flex: 1,
+          minHeight: 0,
+          border: '1px solid var(--border)',
           borderRadius: 8,
         }}>
           <div style={{ width: LEFT_W + gridW, position: 'relative' }}>
@@ -536,8 +1133,8 @@ const handleSaveActivity = async (activityData) => {
             <div style={{
               position: 'sticky', top: 0, zIndex: 15,
               display: 'flex', height: ROW_H,
-              backgroundColor: '#f3f4f6',
-              borderBottom: '2px solid #e5e7eb',
+              backgroundColor: 'var(--surface2)',
+              borderBottom: '2px solid var(--border)',
             }}>
               <div style={{
                 position: 'sticky', left: 0, zIndex: 20,
@@ -545,42 +1142,46 @@ const handleSaveActivity = async (activityData) => {
                 padding: '0 12px',
                 display: 'flex', alignItems: 'center',
                 fontWeight: 700, fontSize: 13,
-                backgroundColor: '#f3f4f6',
-                borderRight: '2px solid #e5e7eb',
+                backgroundColor: 'var(--surface2)',
+                borderRight: '2px solid var(--border)',
               }}>
-                {groupBy === 'project' ? 'Progetto / Attività' : 'Tecnico / Impegni'}
+                {groupBy === 'project' ? t('projectActivity') : t('technicianTasks')}
               </div>
               {dates.map((date, i) => (
                 <div key={i} style={{
                   width: DAY_W, minWidth: DAY_W,
                   display: 'flex', flexDirection: 'column',
                   alignItems: 'center', justifyContent: 'center',
-                  borderRight: '1px solid #e5e7eb',
-                  backgroundColor: isToday(date) ? '#dbeafe' : 'transparent',
+                  borderRight: '1px solid var(--border)',
+                  backgroundColor: isToday(date) ? 'var(--surface2)' : 'transparent',
                 }}>
                   <div style={{ fontSize: viewMode === 'week' ? 13 : 11, fontWeight: 700 }}>{formatDate(date)}</div>
-                  <div style={{ fontSize: 10, color: '#6b7280' }}>
-                    {date.toLocaleDateString('it-IT', { weekday: 'short' })}
+                  <div style={{ fontSize: 10, color: 'var(--muted)' }}>
+                    {date.toLocaleDateString(locale, { weekday: 'short' })}
                   </div>
                 </div>
               ))}
             </div>
 
             {/* ===== VISTA PER PROGETTO ===== */}
-            {groupBy === 'project' && projects.map(project => {
-              const acts = activities.filter(a => a.project_id === project.id);
+            {groupBy === 'project' && visibleProjects.map(project => {
+              const techSet = new Set(filterTechIds);
+              const acts = (activitiesByProject.get(project.id) || []).filter(a =>
+                (!onlyConflicts || conflictingActivityIds.has(a.id)) &&
+                (!techSet.size || (a.technicians || []).some(t => techSet.has(t.id)))
+              );
               return (
                 <div key={project.id}>
-                  <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid #e5e7eb', backgroundColor: '#ffffff' }}>
+                  <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid var(--border)', backgroundColor: 'var(--surface)' }}>
                     <LeftCell bg="#ffffff" onClick={() => toggleProject(project.id)}>
                       <div style={{ display: 'flex', alignItems: 'center', fontWeight: 600, fontSize: 13 }}>
                         {project.expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                        <span style={{ marginLeft: 8, color: project.color || '#3b82f6', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                          {project.code} - {project.name}
+                        <span style={{ marginLeft: 8, color: project.color || '#555555', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                          {countryFlag(project.country)} {project.code} - {project.name}
                         </span>
                       </div>
-                      <div style={{ fontSize: 11, color: '#9ca3af', marginLeft: 24 }}>
-                        {acts.length} attività
+                      <div style={{ fontSize: 11, color: onlyConflicts ? '#ef4444' : 'var(--muted)', marginLeft: 24 }}>
+                        {acts.length} {onlyConflicts ? t('inConflict') : t('activityCount')}
                       </div>
                     </LeftCell>
                     <div style={{ width: gridW, minWidth: gridW, ...gridBg }} />
@@ -591,8 +1192,9 @@ const handleSaveActivity = async (activityData) => {
                       key={activity.id}
                       activity={activity}
                       label={activity.name}
-                      sub={(activity.technicians || []).map(t => t.name).join(', ') || 'Non assegnato'}
+                      sub={(activity.technicians || []).map(x => x.name).join(', ') || t('unassigned')}
                       color={project.color}
+                      barText={`${project.code} · ${activity.name} · ${activity.progress ?? 0}%`}
                     />
                   ))}
                 </div>
@@ -600,9 +1202,12 @@ const handleSaveActivity = async (activityData) => {
             })}
 
             {/* ===== VISTA PER TECNICO ===== */}
-            {groupBy === 'technician' && technicians.map(tech => {
-              const acts = activities.filter(a =>
-                (a.technicians || []).some(t => t.id === tech.id)
+            {groupBy === 'technician' && visibleTechnicians.map(tech => {
+              const techAbsences = absences.filter(x => x.technician_id === tech.id);
+              const visibleIds = new Set(visibleProjects.map(p => p.id));
+              const acts = (activitiesByTech.get(tech.id) || []).filter(a =>
+                visibleIds.has(a.project_id) &&
+                (!onlyConflicts || conflictingActivityIds.has(a.id))
               );
               const expanded = expandedTechs.includes(tech.id);
               const busy = loadDays(acts);
@@ -610,25 +1215,40 @@ const handleSaveActivity = async (activityData) => {
 
               return (
                 <div key={tech.id}>
-                  <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid #e5e7eb', backgroundColor: '#ffffff' }}>
+                  <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid var(--border)', backgroundColor: 'var(--surface)' }}>
                     <LeftCell bg="#ffffff" onClick={() => toggleTech(tech.id)}>
                       <div style={{ display: 'flex', alignItems: 'center', fontWeight: 600, fontSize: 13 }}>
                         {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                         <span style={{
                           marginLeft: 8, width: 10, height: 10, borderRadius: '50%',
-                          backgroundColor: tech.color || '#3b82f6', display: 'inline-block', flexShrink: 0,
+                          backgroundColor: tech.color || '#555555', display: 'inline-block', flexShrink: 0,
                         }} />
                         <span style={{ marginLeft: 8, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
                           {tech.name}
                         </span>
                       </div>
-                      <div style={{ fontSize: 11, color: '#9ca3af', marginLeft: 24 }}>
-                        Carico: {busy}/{dates.length} gg ({pct}%)
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 24 }}>
+                        {t('workload')}: {busy}/{dates.length} {t('days')} ({pct}%)
                       </div>
                     </LeftCell>
 
                     {/* Barre compatte anche a gruppo chiuso: sovrapposizioni = conflitto */}
                     <div style={{ width: gridW, minWidth: gridW, position: 'relative', ...gridBg }}>
+                      {/* Assenze: fasce tratteggiate sotto le barre, mai cliccabili */}
+                      {techAbsences.map(ab => {
+                        const p = barPos(ab);
+                        if (!p) return null;
+                        return (
+                          <div key={'ab' + ab.id}
+                            title={`${t('absence')}: ${t('abs_' + ab.type)}${ab.note ? ' — ' + ab.note : ''}`}
+                            style={{
+                              position: 'absolute', top: 0, bottom: 0,
+                              left: p.left, width: p.width,
+                              backgroundImage: 'repeating-linear-gradient(45deg, var(--muted) 0 3px, transparent 3px 8px)',
+                              opacity: 0.45, pointerEvents: 'none', zIndex: 1,
+                            }} />
+                        );
+                      })}
                       {!expanded && acts.map(a => {
                         const p = barPos(a);
                         if (!p) return null;
@@ -639,7 +1259,7 @@ const handleSaveActivity = async (activityData) => {
                             style={{
                               position: 'absolute', top: 14, height: 20,
                               left: p.left, width: p.width,
-                              backgroundColor: prj?.color || '#3b82f6',
+                              backgroundColor: prj?.color || '#555555',
                               borderRadius: 3, opacity: 0.85,
                               fontSize: 10, color: 'white',
                               display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -659,8 +1279,9 @@ const handleSaveActivity = async (activityData) => {
                         key={activity.id}
                         activity={activity}
                         label={activity.name}
-                        sub={prj ? `${prj.code} - ${prj.name}` : 'Progetto sconosciuto'}
+                        sub={prj ? `${countryFlag(prj.country)} ${prj.code} - ${prj.name}` : 'Progetto sconosciuto'}
                         color={prj?.color}
+                        barText={`${prj ? prj.code + ' · ' : ''}${activity.name} · ${activity.progress ?? 0}%`}
                       />
                     );
                   })}
@@ -670,6 +1291,13 @@ const handleSaveActivity = async (activityData) => {
 
           </div>
         </div>
+
+        {((groupBy === 'project' && visibleProjects.length === 0) ||
+          (groupBy === 'technician' && visibleTechnicians.length === 0)) && (
+          <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--muted)', fontSize: 14, flexShrink: 0 }}>
+            {t('noResults')}
+          </div>
+        )}
       </div>
     );
   };
@@ -681,17 +1309,17 @@ const handleSaveActivity = async (activityData) => {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
+        backgroundColor: 'var(--barBg)'
       }}>
         <div style={{
-          backgroundColor: 'white',
+          backgroundColor: 'var(--surface)',
           padding: '2rem',
           borderRadius: '10px',
           boxShadow: '0 10px 25px rgba(0,0,0,0.2)',
           width: '100%',
           maxWidth: '400px'
         }}>
-          <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: '#333' }}>
+          <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: 'var(--fg)' }}>
             Progetto.io - Login
           </h2>
           <form onSubmit={handleLogin}>
@@ -705,7 +1333,7 @@ const handleSaveActivity = async (activityData) => {
                 width: '100%',
                 padding: '12px',
                 marginBottom: '1rem',
-                border: '1px solid #ddd',
+                border: '1px solid var(--border)',
                 borderRadius: '5px',
                 fontSize: '1rem',
                 boxSizing: 'border-box'
@@ -721,7 +1349,7 @@ const handleSaveActivity = async (activityData) => {
                 width: '100%',
                 padding: '12px',
                 marginBottom: '1rem',
-                border: '1px solid #ddd',
+                border: '1px solid var(--border)',
                 borderRadius: '5px',
                 fontSize: '1rem',
                 boxSizing: 'border-box'
@@ -745,8 +1373,8 @@ const handleSaveActivity = async (activityData) => {
               style={{
                 width: '100%',
                 padding: '12px',
-                backgroundColor: '#667eea',
-                color: 'white',
+                backgroundColor: 'var(--accent)',
+                color: 'var(--accentFg)',
                 border: 'none',
                 borderRadius: '5px',
                 fontSize: '1rem',
@@ -763,153 +1391,179 @@ const handleSaveActivity = async (activityData) => {
     );
   }
 
+  // Navigazione: la voce attiva si distingue con una banda sotto, non con un
+  // riempimento — su una barra piena il riempimento sporcherebbe il contrasto.
+  const navStyle = (view) => ({
+    background: 'transparent',
+    color: 'var(--barFg)',
+    border: 'none',
+    borderBottom: `3px solid ${currentView === view ? 'var(--barFg)' : 'transparent'}`,
+    padding: '0 0.75rem',
+    margin: 0,
+    height: 48,
+    cursor: 'pointer',
+    fontSize: '0.85rem',
+    fontWeight: currentView === view ? 700 : 400,
+    opacity: currentView === view ? 1 : 0.72,
+    transition: 'opacity 0.15s',
+    whiteSpace: 'nowrap',
+  });
+  const navHover = {
+    onMouseEnter: (e) => { e.currentTarget.style.opacity = 1; },
+    onMouseLeave: (e) => {
+      const v = e.currentTarget.getAttribute('data-view');
+      e.currentTarget.style.opacity = currentView === v ? 1 : 0.72;
+    },
+  };
+
   return (
-    <div style={{ minHeight: '100vh', backgroundColor: '#f5f5f5' }}>
-      {/* Header */}
+    <div style={{ minHeight: '100vh', backgroundColor: 'var(--bg)', color: 'var(--fg)' }}>
+      {/* Header — barra piena, senza ombra: la separazione la fa il contrasto */}
       <div style={{
-        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-        padding: '1rem',
-        boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+        backgroundColor: 'var(--barBg)',
+        padding: '0 1rem',
         display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between'
+        alignItems: 'stretch',
+        justifyContent: 'space-between',
+        minHeight: 48,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <h1 style={{ color: 'white', margin: 0, fontSize: '1.5rem' }}>Progetto.io</h1>
+          <h1 style={{
+            color: 'var(--barFg)', margin: 0, fontSize: '1.05rem',
+            fontWeight: 700, letterSpacing: '0.02em',
+          }}>Progetto.io</h1>
         </div>
 
         <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-          <button
-            onClick={() => setCurrentView('dashboard')}
+          <select
+            value={lang}
+            onChange={(e) => setLang(e.target.value)}
+            title={t('language')}
             style={{
-              background: currentView === 'dashboard' ? 'rgba(255,255,255,0.3)' : 'transparent',
-              color: 'white',
-              border: 'none',
-              padding: '0.75rem 1.5rem',
-              borderRadius: '8px',
+              padding: '0.25rem 0.4rem',
+              borderRadius: 4,
+              border: '1px solid var(--barFg)',
+              backgroundColor: 'transparent',
+              color: 'var(--barFg)',
               cursor: 'pointer',
-              fontWeight: '600',
-              transition: 'all 0.3s'
+              fontSize: '0.8rem',
+              alignSelf: 'center',
             }}
           >
-            📊 Dashboard
+            {LANGUAGES.map(l => (
+              <option key={l.code} value={l.code} style={{ color: '#121212', backgroundColor: 'var(--surface)' }}>
+                {l.flag} {l.code.toUpperCase()}
+              </option>
+            ))}
+          </select>
+
+          <button
+            onClick={() => setInverted(v => !v)}
+            title={t('invertColors')}
+            style={{
+              alignSelf: 'center',
+              width: 26, height: 26, padding: 0,
+              borderRadius: '50%',
+              border: '1px solid var(--barFg)',
+              cursor: 'pointer',
+              background: 'linear-gradient(90deg, var(--barFg) 0 50%, var(--barBg) 50% 100%)',
+            }}
+          />
+
+          <button
+            onClick={() => setCurrentView('dashboard')}
+            style={navStyle('dashboard')}
+            data-view="dashboard"
+            {...navHover}
+          >
+            📊 {t('dashboard')}
           </button>
 
           <button
             onClick={() => setCurrentView('projects')}
-            style={{
-              background: currentView === 'projects' ? 'rgba(255,255,255,0.3)' : 'transparent',
-              color: 'white',
-              border: 'none',
-              padding: '0.75rem 1.5rem',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontWeight: '600',
-              transition: 'all 0.3s'
-            }}
+            style={navStyle('projects')}
+            data-view="projects"
+            {...navHover}
           >
-            📁 Progetti
+            📁 {t('projects')}
           </button>
 
           <button
             onClick={() => setCurrentView('activities')}
-            style={{
-              background: currentView === 'activities' ? 'rgba(255,255,255,0.3)' : 'transparent',
-              color: 'white',
-              border: 'none',
-              padding: '0.75rem 1.5rem',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontWeight: '600',
-              transition: 'all 0.3s'
-            }}
+            style={navStyle('activities')}
+            data-view="activities"
+            {...navHover}
           >
             ✅ Attività
           </button>
 
           <button
             onClick={() => setCurrentView('technicians')}
-            style={{
-              background: currentView === 'technicians' ? 'rgba(255,255,255,0.3)' : 'transparent',
-              color: 'white',
-              border: 'none',
-              padding: '0.75rem 1.5rem',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontWeight: '600',
-              transition: 'all 0.3s'
-            }}
+            style={navStyle('technicians')}
+            data-view="technicians"
+            {...navHover}
           >
-            👥 Tecnici
+            👥 {t('technicians')}
           </button>
 
 	{(user?.role === 'admin' || user?.role === 'editor') && (
           <button
             onClick={() => setCurrentView('conflicts')}
-	style={{
-              padding: '0.75rem 1.5rem',
-              backgroundColor: currentView === 'conflicts' ? 'rgba(220, 53, 69, 0.2)' : 'transparent',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontWeight: '600',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem',
-              transition: 'all 0.2s'
-            }}
-            onMouseEnter={(e) => {
-              e.target.style.backgroundColor = 'rgba(255,255,255,0.1)';
-            }}
-            onMouseLeave={(e) => {
-              e.target.style.backgroundColor = 'transparent';
-            }}
-            onMouseEnter={(e) => {
-              e.target.style.backgroundColor = '#fef2f2';
-              e.target.style.color = '#dc3545';
-            }}
-            onMouseLeave={(e) => {
-              e.target.style.backgroundColor = 'white';
-              e.target.style.color = '#374151';
-            }}
+            style={navStyle('conflicts')}
+            data-view="conflicts"
+            {...navHover}
           >
-            ⚠️ Conflitti
+            ⚠️ {t('conflicts')}
           </button>
         )}
+
+          <button
+            onClick={() => setCurrentView('reports')}
+            style={navStyle('reports')}
+            data-view="reports"
+            {...navHover}
+          >
+            📄 {t('reports')}
+          </button>
+
+          {user?.role === 'admin' && (
+            <button
+              onClick={() => setCurrentView('system')}
+              style={navStyle('system')}
+              data-view="system"
+              {...navHover}
+            >
+              🗄 {t('maintenance')}
+            </button>
+          )}
 
           {user?.role === 'admin' && (
             <button
               onClick={() => setCurrentView('users')}
-              style={{
-                background: currentView === 'users' ? 'rgba(255,255,255,0.3)' : 'transparent',
-                color: 'white',
-                border: 'none',
-                padding: '0.75rem 1.5rem',
-                borderRadius: '8px',
-                cursor: 'pointer',
-                fontWeight: '600',
-                transition: 'all 0.3s'
-              }}
+              style={navStyle('users')}
+              data-view="users"
+              {...navHover}
             >
-              🔐 Utenti
+              🔐 {t('users')}
             </button>
           )}
 
-          <span style={{ color: 'white', fontWeight: '600' }}>
+          <span style={{ color: 'var(--barFg)', fontWeight: 600, fontSize: '0.85rem', alignSelf: 'center' }}>
             {user?.name} ({user?.role})
           </span>
 
           <button
             onClick={handleLogout}
             style={{
-              background: 'rgba(255,255,255,0.2)',
-              color: 'white',
-              border: '1px solid rgba(255,255,255,0.3)',
-              padding: '0.75rem 1.5rem',
-              borderRadius: '8px',
+              background: 'transparent',
+              color: 'var(--barFg)',
+              border: '1px solid var(--barFg)',
+              padding: '0.3rem 0.7rem',
+              borderRadius: 5,
               cursor: 'pointer',
-              fontWeight: '600'
+              alignSelf: 'center',
+              display: 'flex',
+              alignItems: 'center',
             }}
           >
             <LogOut size={18} />
@@ -918,7 +1572,7 @@ const handleSaveActivity = async (activityData) => {
       </div>
 
       {/* Contenuto Principale */}
-      <div style={{ padding: '2rem' }}>
+      <div style={{ padding: '0.75rem 1rem' }}>
         {currentView === 'dashboard' && (
           <div>
             {/* Controlli Vista */}
@@ -926,40 +1580,40 @@ const handleSaveActivity = async (activityData) => {
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
-              marginBottom: '1rem',
-              backgroundColor: 'white',
-              padding: '1rem',
-              borderRadius: '8px',
-              boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+              marginBottom: '0.6rem',
+              backgroundColor: 'var(--surface)',
+              padding: '0.5rem 0.75rem',
+              borderRadius: 6,
+              border: '1px solid var(--border)'
             }}>
               <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
                 <button
                   onClick={() => setViewMode('week')}
                   style={{
                     padding: '0.5rem 1rem',
-                    backgroundColor: viewMode === 'week' ? '#667eea' : '#e5e7eb',
-                    color: viewMode === 'week' ? 'white' : '#333',
+                    backgroundColor: viewMode === 'week' ? 'var(--accent)' : 'var(--surface2)',
+                    color: viewMode === 'week' ? 'var(--accentFg)' : 'var(--fg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
                     fontWeight: '600'
                   }}
                 >
-                  Settimana
+                  {t('week')}
                 </button>
                 <button
                   onClick={() => setViewMode('month')}
                   style={{
                     padding: '0.5rem 1rem',
-                    backgroundColor: viewMode === 'month' ? '#667eea' : '#e5e7eb',
-                    color: viewMode === 'month' ? 'white' : '#333',
+                    backgroundColor: viewMode === 'month' ? 'var(--accent)' : 'var(--surface2)',
+                    color: viewMode === 'month' ? 'var(--accentFg)' : 'var(--fg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
                     fontWeight: '600'
                   }}
                 >
-                  Mese
+                  {t('month')}
                 </button>
               </div>
 
@@ -978,14 +1632,14 @@ const handleSaveActivity = async (activityData) => {
                   }}
                   style={{
                     padding: '0.5rem 1rem',
-                    backgroundColor: '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer'
                   }}
                 >
-                  ◀ Precedente
+                  ◀ {t('previous')}
                 </button>
 
                 <span style={{ fontWeight: '600', minWidth: '200px', textAlign: 'center' }}>
@@ -1009,14 +1663,14 @@ const handleSaveActivity = async (activityData) => {
                   }}
                   style={{
                     padding: '0.5rem 1rem',
-                    backgroundColor: '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer'
                   }}
                 >
-                  Successivo ▶
+                  {t('next')} ▶
                 </button>
 
                 <button
@@ -1037,16 +1691,16 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Oggi
+                  {t('today')}
                 </button>
               </div>
             </div>
 
             {/* Gantt Chart */}
             <div style={{
-              backgroundColor: 'white',
+              backgroundColor: 'var(--surface)',
               borderRadius: '8px',
-              boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+              border: '1px solid var(--border)',
               overflow: 'hidden'
             }}>
               {renderGanttChart()}
@@ -1056,23 +1710,23 @@ const handleSaveActivity = async (activityData) => {
 
         {currentView === 'projects' && (
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '8px',
-            boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+            border: '1px solid var(--border)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
               <h2 style={{ margin: 0 }}>Gestione Progetti</h2>
               {(user?.role === 'admin' || user?.role === 'editor') && (
                 <button
                   onClick={() => {
-                    setEditingProject({ code: '', name: '', color: '#3b82f6' });
+                    setEditingProject({ code: '', name: '', color: '#555555' });
                     setShowProjectModal(true);
                   }}
                   style={{
                     padding: '0.75rem 1.5rem',
-                    backgroundColor: '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -1089,18 +1743,18 @@ const handleSaveActivity = async (activityData) => {
 
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
-                <tr style={{ backgroundColor: '#f3f4f6' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Codice</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Colore</th>
+                <tr style={{ backgroundColor: 'var(--surface2)' }}>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Codice</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Nome</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Colore</th>
                   {(user?.role === 'admin' || user?.role === 'editor') && (
-                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid #e5e7eb' }}>Azioni</th>
+                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>Azioni</th>
                   )}
                 </tr>
               </thead>
               <tbody>
                 {projects.map(project => (
-                  <tr key={project.id} style={{ borderBottom: '1px solid #e5e7eb' }}>
+                  <tr key={project.id} style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '12px' }}>{project.code}</td>
                     <td style={{ padding: '12px' }}>{project.name}</td>
                     <td style={{ padding: '12px' }}>
@@ -1109,11 +1763,23 @@ const handleSaveActivity = async (activityData) => {
                         height: '30px',
                         backgroundColor: project.color,
                         borderRadius: '5px',
-                        border: '1px solid #ddd'
+                        border: '1px solid var(--border)'
                       }} />
                     </td>
                     {(user?.role === 'admin' || user?.role === 'editor') && (
                       <td style={{ padding: '12px', textAlign: 'center' }}>
+                        <button
+                          onClick={() => handleDuplicateProject(project)}
+                          title={t('duplicate')}
+                          style={{
+                            padding: '0.5rem 0.7rem', backgroundColor: 'transparent',
+                            color: 'var(--fg)', border: '1px solid var(--border)',
+                            borderRadius: '5px', cursor: 'pointer', marginRight: '0.5rem',
+                            fontSize: '0.8rem',
+                          }}
+                        >
+                          ⧉
+                        </button>
                         <button
                           onClick={() => {
                             setEditingProject(project);
@@ -1121,8 +1787,8 @@ const handleSaveActivity = async (activityData) => {
                           }}
                           style={{
                             padding: '0.5rem',
-                            backgroundColor: '#3b82f6',
-                            color: 'white',
+                            backgroundColor: 'var(--muted)',
+                            color: 'var(--accentFg)',
                             border: 'none',
                             borderRadius: '5px',
                             cursor: 'pointer',
@@ -1157,13 +1823,18 @@ const handleSaveActivity = async (activityData) => {
 
         {currentView === 'activities' && (
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '8px',
-            boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+            border: '1px solid var(--border)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ margin: 0 }}>Gestione Attività</h2>
+              <h2 style={{ margin: 0 }}>
+                Gestione Attività
+                <span style={{ fontSize: '0.8rem', fontWeight: 400, color: 'var(--muted)', marginLeft: 10 }}>
+                  {activities.length} {t('activityCount')}
+                </span>
+              </h2>
               {(user?.role === 'admin' || user?.role === 'editor') && (
                 <button
                   onClick={() => {
@@ -1173,8 +1844,8 @@ const handleSaveActivity = async (activityData) => {
                   }}
                   style={{
                     padding: '0.75rem 1.5rem',
-                    backgroundColor: '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -1189,96 +1860,255 @@ const handleSaveActivity = async (activityData) => {
               )}
             </div>
 
-            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr style={{ backgroundColor: '#f3f4f6' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Progetto</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Tecnico</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Data Inizio</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Data Fine</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Progresso</th>
-                  {(user?.role === 'admin' || user?.role === 'editor') && (
-                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid #e5e7eb' }}>Azioni</th>
-                  )}
-                </tr>
-              </thead>
-              <tbody>
-                {activities.map(activity => {
-                  const project = projects.find(p => p.id === activity.project_id);
-                  const activityTechs = activity.technicians || [];
-                  return (
-                    <tr key={activity.id} style={{ borderBottom: '1px solid #e5e7eb' }}>
-                      <td style={{ padding: '12px' }}>{activity.name}</td>
-                      <td style={{ padding: '12px' }}>{project?.name || '-'}</td>
-                      <td style={{ padding: '12px' }}>{activityTechs.length > 0 ? activityTechs.map(t => t.name).join(', ') : '-'}</td>
-                      <td style={{ padding: '12px' }}>{new Date(activity.start_date).toLocaleDateString('it-IT')}</td>
-                      <td style={{ padding: '12px' }}>{new Date(activity.end_date).toLocaleDateString('it-IT')}</td>
-                      <td style={{ padding: '12px' }}>{activity.progress}%</td>
-                      {(user?.role === 'admin' || user?.role === 'editor') && (
-                        <td style={{ padding: '12px', textAlign: 'center' }}>
-                          <button
-                            onClick={() => {
-                              setEditingActivity(activity);
-                              setSelectedTechnicians(activity.technicians?.map(t => t.id) || []);
-			      setShowActivityModal(true);
-                            }}
+            {/* Filtri */}
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center',
+              padding: '8px 10px', marginBottom: '1rem',
+              backgroundColor: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 6,
+            }}>
+              <span style={{ fontSize: 12, color: 'var(--muted)', fontWeight: 600 }}>{t('country')}:</span>
+              {availableCountries.map(cc => {
+                const on = activityCountries.includes(cc);
+                return (
+                  <button key={cc}
+                    title={COUNTRY_NAMES[cc] || cc}
+                    onClick={() => {
+                      setActivityCountries(prev => prev.includes(cc) ? prev.filter(x => x !== cc) : [...prev, cc]);
+                      setActivityPage(0);
+                    }}
+                    style={{
+                      padding: '4px 10px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                      border: on ? '1px solid var(--accent)' : '1px solid var(--border)',
+                      backgroundColor: on ? 'var(--accent)' : 'var(--surface)',
+                      color: on ? 'var(--accentFg)' : 'var(--fg)',
+                    }}>
+                    {countryFlag(cc)} {cc}
+                  </button>
+                );
+              })}
+
+              <input
+                type="text"
+                value={activitySearch}
+                onChange={(e) => { setActivitySearch(e.target.value); setActivityPage(0); }}
+                placeholder={t('searchProject')}
+                style={{
+                  flex: 1, minWidth: 200, maxWidth: 320,
+                  padding: '5px 10px', fontSize: 13, borderRadius: 5,
+                  border: '1px solid var(--border)',
+                  backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                }}
+              />
+
+              {(activityCountries.length > 0 || activitySearch) && (
+                <button
+                  onClick={() => { setActivityCountries([]); setActivitySearch(''); setActivityPage(0); }}
+                  style={{
+                    padding: '4px 10px', fontSize: 12, cursor: 'pointer',
+                    border: '1px solid var(--border)', borderRadius: 5,
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }}>
+                  {t('clearFilters')}
+                </button>
+              )}
+            </div>
+
+            {(() => {
+              // Raggruppate per progetto: con migliaia di attivita' un elenco
+              // piatto non dice a cosa appartiene ciascuna riga.
+              const q = activitySearch.trim().toLowerCase();
+              const withActs = projects
+                .map(p => ({ project: p, acts: activitiesByProject.get(p.id) || [] }))
+                .filter(g => g.acts.length > 0)
+                .filter(g => !activityCountries.length || activityCountries.includes(g.project.country))
+                .filter(g => !q || `${g.project.code} ${g.project.name}`.toLowerCase().includes(q)
+                          || g.acts.some(a => a.name.toLowerCase().includes(q)))
+                .sort((a, b) => (a.project.country || '').localeCompare(b.project.country || '')
+                              || a.project.code.localeCompare(b.project.code));
+
+              const totalPages = Math.ceil(withActs.length / PROJECTS_PER_PAGE);
+              const page = withActs.slice(activityPage * PROJECTS_PER_PAGE, (activityPage + 1) * PROJECTS_PER_PAGE);
+              const canEdit = user?.role === 'admin' || user?.role === 'editor';
+
+              if (!withActs.length) {
+                return <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--muted)' }}>{t('noResults')}</div>;
+              }
+
+              return (
+                <>
+                  <div style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
+                    {page.map(({ project, acts }) => {
+                      const open = expandedActProjects.includes(project.id);
+                      return (
+                        <div key={project.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                          {/* Riga progetto */}
+                          <div
+                            onClick={() => setExpandedActProjects(prev =>
+                              prev.includes(project.id) ? prev.filter(x => x !== project.id) : [...prev, project.id])}
                             style={{
-                              padding: '0.5rem',
-                              backgroundColor: '#3b82f6',
-                              color: 'white',
-                              border: 'none',
-                              borderRadius: '5px',
-                              cursor: 'pointer',
-                              marginRight: '0.5rem'
-                            }}
-                          >
-                            <Edit2 size={16} />
-                          </button>
-                          {user?.role === 'admin' && (
-                            <button
-                              onClick={() => handleDeleteActivity(activity.id)}
-                              style={{
-                                padding: '0.5rem',
-                                backgroundColor: '#ef4444',
-                                color: 'white',
-                                border: 'none',
-                                borderRadius: '5px',
-                                cursor: 'pointer'
-                              }}
-                            >
-                              <Trash2 size={16} />
-                            </button>
+                              display: 'flex', alignItems: 'center', gap: 10,
+                              padding: '10px 12px', cursor: 'pointer',
+                              backgroundColor: open ? 'var(--surface2)' : 'var(--surface)',
+                            }}>
+                            {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                            <span style={{
+                              width: 10, height: 10, borderRadius: 2, flexShrink: 0,
+                              backgroundColor: project.color || '#555555',
+                            }} />
+                            <strong style={{ fontSize: 13, minWidth: 90 }}>
+                              {countryFlag(project.country)} {project.code}
+                            </strong>
+                            <span style={{ fontSize: 13 }}>{project.name}</span>
+                            <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--muted)' }}>
+                              {acts.length} {t('activityCount')}
+                            </span>
+                          </div>
+
+                          {/* Attività del progetto */}
+                          {open && (
+                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                              <thead>
+                                <tr style={{ backgroundColor: 'var(--surface2)' }}>
+                                  {[t('activity'), t('technician'), t('startDate'), t('endDate'), t('progress')].map((h, i) => (
+                                    <th key={i} style={{
+                                      textAlign: 'left', padding: '7px 12px', fontSize: 12,
+                                      borderBottom: '1px solid var(--border)',
+                                      paddingLeft: i === 0 ? 40 : 12,
+                                    }}>{h}</th>
+                                  ))}
+                                  {canEdit && <th style={{ borderBottom: '1px solid var(--border)' }} />}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {[...acts]
+                                  .sort((a, b) => actStartUnit(a) - actStartUnit(b))
+                                  .map(activity => {
+                                    const techs = activity.technicians || [];
+                                    const inConflict = conflictingActivityIds.has(activity.id)
+                                                    || absenceConflicts.has(activity.id);
+                                    return (
+                                      <tr key={activity.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                                        <td style={{ padding: '7px 12px 7px 40px' }}>
+                                          {inConflict && <span title={t('conflict')} style={{ marginRight: 6 }}>⚠</span>}
+                                          {activity.name}
+                                        </td>
+                                        <td style={{ padding: '7px 12px', color: techs.length ? 'var(--fg)' : 'var(--muted)' }}>
+                                          {techs.length ? techs.map(x => x.name).join(', ') : t('unassigned')}
+                                        </td>
+                                        <td style={{ padding: '7px 12px', whiteSpace: 'nowrap' }}>
+                                          {new Date(activity.start_date).toLocaleDateString(locale)}
+                                          {activity.start_half === 'PM' && (
+                                            <span style={{ color: 'var(--muted)', fontSize: 11 }}> ({t('afternoon')})</span>
+                                          )}
+                                        </td>
+                                        <td style={{ padding: '7px 12px', whiteSpace: 'nowrap' }}>
+                                          {new Date(activity.end_date).toLocaleDateString(locale)}
+                                          {activity.end_half === 'AM' && (
+                                            <span style={{ color: 'var(--muted)', fontSize: 11 }}> ({t('morning')})</span>
+                                          )}
+                                        </td>
+                                        <td style={{ padding: '7px 12px', whiteSpace: 'nowrap' }}>
+                                          <span style={{
+                                            display: 'inline-block', width: 46, height: 6, borderRadius: 3,
+                                            backgroundColor: 'var(--border)', verticalAlign: 'middle', marginRight: 6,
+                                          }}>
+                                            <span style={{
+                                              display: 'block', height: '100%', borderRadius: 3,
+                                              width: `${activity.progress || 0}%`,
+                                              backgroundColor: project.color || '#555555',
+                                            }} />
+                                          </span>
+                                          {activity.progress || 0}%
+                                        </td>
+                                        {canEdit && (
+                                          <td style={{ padding: '7px 12px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                            <button
+                                              onClick={() => {
+                                                setEditingActivity(activity);
+                                                setSelectedTechnicians(techs.map(x => x.id));
+                                                setShowEditModal(true);
+                                              }}
+                                              style={{
+                                                background: 'transparent', border: '1px solid var(--border)',
+                                                borderRadius: 4, color: 'var(--fg)', cursor: 'pointer',
+                                                padding: '3px 7px', marginRight: 4,
+                                              }}>
+                                              <Edit2 size={13} />
+                                            </button>
+                                            <button
+                                              onClick={() => handleDeleteActivity(activity.id)}
+                                              style={{
+                                                background: 'transparent', border: '1px solid var(--border)',
+                                                borderRadius: 4, color: '#ef4444', cursor: 'pointer',
+                                                padding: '3px 7px',
+                                              }}>
+                                              <Trash2 size={13} />
+                                            </button>
+                                          </td>
+                                        )}
+                                      </tr>
+                                    );
+                                  })}
+                              </tbody>
+                            </table>
                           )}
-                        </td>
-                      )}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {totalPages > 1 && (
+                    <div style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12,
+                      padding: '1rem 0 0 0',
+                    }}>
+                      <button onClick={() => setActivityPage(Math.max(0, activityPage - 1))}
+                        disabled={activityPage === 0}
+                        style={{
+                          padding: '6px 14px', borderRadius: 5, fontSize: 13,
+                          border: '1px solid var(--border)', backgroundColor: 'var(--surface)',
+                          cursor: activityPage === 0 ? 'not-allowed' : 'pointer',
+                          color: activityPage === 0 ? 'var(--muted)' : 'var(--fg)',
+                        }}>{t('previousPage')}</button>
+                      <span style={{ fontSize: 13, color: 'var(--muted)' }}>
+                        {activityPage * PROJECTS_PER_PAGE + 1}–
+                        {Math.min((activityPage + 1) * PROJECTS_PER_PAGE, withActs.length)} {t('of')} {withActs.length}
+                      </span>
+                      <button onClick={() => setActivityPage(activityPage + 1)}
+                        disabled={activityPage + 1 >= totalPages}
+                        style={{
+                          padding: '6px 14px', borderRadius: 5, fontSize: 13,
+                          border: '1px solid var(--border)', backgroundColor: 'var(--surface)',
+                          cursor: activityPage + 1 >= totalPages ? 'not-allowed' : 'pointer',
+                          color: activityPage + 1 >= totalPages ? 'var(--muted)' : 'var(--fg)',
+                        }}>{t('nextPage')}</button>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
 
         {currentView === 'technicians' && (
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '8px',
-            boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+            border: '1px solid var(--border)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
               <h2 style={{ margin: 0 }}>Gestione Tecnici</h2>
               {(user?.role === 'admin' || user?.role === 'editor') && (
                 <button
                   onClick={() => {
-                    setEditingTechnician({ name: '', email: '', phone: '', specialization: '', color: '#3b82f6' });
+                    setEditingTechnician({ name: '', email: '', phone: '', specialization: '', color: '#555555' });
                     setShowTechnicianModal(true);
                   }}
                   style={{
                     padding: '0.75rem 1.5rem',
-                    backgroundColor: '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -1295,20 +2125,20 @@ const handleSaveActivity = async (activityData) => {
 
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
-                <tr style={{ backgroundColor: '#f3f4f6' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Email</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Telefono</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Specializzazione</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Colore</th>
+                <tr style={{ backgroundColor: 'var(--surface2)' }}>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Nome</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Email</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Telefono</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Specializzazione</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Colore</th>
                   {(user?.role === 'admin' || user?.role === 'editor') && (
-                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid #e5e7eb' }}>Azioni</th>
+                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>Azioni</th>
                   )}
                 </tr>
               </thead>
               <tbody>
                 {technicians.map(tech => (
-                  <tr key={tech.id} style={{ borderBottom: '1px solid #e5e7eb' }}>
+                  <tr key={tech.id} style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '12px' }}>{tech.name}</td>
                     <td style={{ padding: '12px' }}>{tech.email}</td>
                     <td style={{ padding: '12px' }}>{tech.phone}</td>
@@ -1319,11 +2149,39 @@ const handleSaveActivity = async (activityData) => {
                         height: '30px',
                         backgroundColor: tech.color,
                         borderRadius: '5px',
-                        border: '1px solid #ddd'
+                        border: '1px solid var(--border)'
                       }} />
                     </td>
                     {(user?.role === 'admin' || user?.role === 'editor') && (
                       <td style={{ padding: '12px', textAlign: 'center' }}>
+                        <button
+                          onClick={() => openDevices(tech)}
+                          title={t('deviceAccess')}
+                          style={{
+                            padding: '0.5rem 0.7rem', backgroundColor: 'transparent',
+                            color: 'var(--fg)', border: '1px solid var(--border)',
+                            borderRadius: '5px', cursor: 'pointer', marginRight: '0.5rem',
+                            fontSize: '0.8rem',
+                          }}
+                        >
+                          📱
+                        </button>
+                        <button
+                          onClick={() => { setAbsenceTech(tech); setEditingAbsence(null); setShowAbsenceModal(true); }}
+                          title={t('absences')}
+                          style={{
+                            padding: '0.5rem 0.7rem',
+                            backgroundColor: 'transparent',
+                            color: 'var(--fg)',
+                            border: '1px solid var(--border)',
+                            borderRadius: '5px',
+                            cursor: 'pointer',
+                            marginRight: '0.5rem',
+                            fontSize: '0.8rem',
+                          }}
+                        >
+                          🏖 {absences.filter(x => x.technician_id === tech.id).length || ''}
+                        </button>
                         <button
                           onClick={() => {
                             setEditingTechnician(tech);
@@ -1331,8 +2189,8 @@ const handleSaveActivity = async (activityData) => {
                           }}
                           style={{
                             padding: '0.5rem',
-                            backgroundColor: '#3b82f6',
-                            color: 'white',
+                            backgroundColor: 'var(--muted)',
+                            color: 'var(--accentFg)',
                             border: 'none',
                             borderRadius: '5px',
                             cursor: 'pointer',
@@ -1367,19 +2225,19 @@ const handleSaveActivity = async (activityData) => {
 
         {currentView === 'users' && user?.role === 'admin' && (
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '8px',
-            boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+            border: '1px solid var(--border)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ margin: 0 }}>Gestione Utenti</h2>
+              <h2 style={{ margin: 0 }}>{t('manageUsers')}</h2>
               <button
                 onClick={() => setShowUserModal(true)}
                 style={{
                   padding: '0.75rem 1.5rem',
-                  backgroundColor: '#667eea',
-                  color: 'white',
+                  backgroundColor: 'var(--accent)',
+                  color: 'var(--accentFg)',
                   border: 'none',
                   borderRadius: '5px',
                   cursor: 'pointer',
@@ -1395,17 +2253,18 @@ const handleSaveActivity = async (activityData) => {
 
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
-                <tr style={{ backgroundColor: '#f3f4f6' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Email</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Telefono</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid #e5e7eb' }}>Ruolo</th>
-                  <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid #e5e7eb' }}>Azioni</th>
+                <tr style={{ backgroundColor: 'var(--surface2)' }}>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Nome</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Email</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Telefono</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Ruolo</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('assignedAreas')}</th>
+                  <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>Azioni</th>
                 </tr>
               </thead>
               <tbody>
                 {users.map(u => (
-                  <tr key={u.id} style={{ borderBottom: '1px solid #e5e7eb' }}>
+                  <tr key={u.id} style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '12px' }}>{u.name}</td>
                     <td style={{ padding: '12px' }}>{u.email}</td>
                     <td style={{ padding: '12px' }}>{u.phone}</td>
@@ -1415,11 +2274,20 @@ const handleSaveActivity = async (activityData) => {
                         borderRadius: '12px',
                         fontSize: '0.85rem',
                         fontWeight: '600',
-                        backgroundColor: u.role === 'admin' ? '#fef3c7' : u.role === 'editor' ? '#dbeafe' : '#f3f4f6',
-                        color: u.role === 'admin' ? '#92400e' : u.role === 'editor' ? '#1e40af' : '#374151'
+                        backgroundColor: u.role === 'admin' ? 'var(--surface2)' : u.role === 'editor' ? 'var(--surface2)' : 'var(--surface2)',
+                        color: u.role === 'admin' ? 'var(--fg)' : u.role === 'editor' ? 'var(--fg)' : 'var(--fg)'
                       }}>
                         {u.role}
                       </span>
+                    </td>
+                    <td style={{ padding: '12px', fontSize: '0.85rem' }}>
+                      {u.role === 'admin'
+                        ? <span style={{ color: 'var(--muted)' }}>{t('allCountries')}</span>
+                        : u.role === 'viewer'
+                          ? <span style={{ color: 'var(--muted)' }}>—</span>
+                          : (u.countries && u.countries.length)
+                            ? <span>{u.countries.map(cc => `${countryFlag(cc)} ${cc}`).join('  ')}</span>
+                            : <span style={{ color: '#dc3545', fontWeight: 600 }}>{t('noAreas')}</span>}
                     </td>
                     <td style={{ padding: '12px', textAlign: 'center' }}>
   			<button
@@ -1429,8 +2297,8 @@ const handleSaveActivity = async (activityData) => {
 			    }}
 			    style={{
 			      padding: '0.5rem',
-			      backgroundColor: '#3b82f6',
-			      color: 'white',
+			      backgroundColor: 'var(--muted)',
+			      color: 'var(--accentFg)',
 			      border: 'none',
 			      borderRadius: '5px',
 			      cursor: 'pointer',
@@ -1460,132 +2328,204 @@ const handleSaveActivity = async (activityData) => {
           </div>
         )}
 	
+        {currentView === 'reports' && (
+          <Reports
+            projects={projects}
+            activities={activities}
+            technicians={technicians}
+            absences={absences}
+            t={t}
+            locale={locale}
+            canEdit={user?.role === 'admin' || user?.role === 'editor'}
+            onActivityClick={(activity) => {
+              setEditingActivity(activity);
+              setSelectedTechnicians(activity.technicians?.map(x => x.id) || []);
+              setShowEditModal(true);
+            }}
+          />
+        )}
+
 	{currentView === 'conflicts' && (
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '8px',
-            boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+            border: '1px solid var(--border)'
           }}>
-            <h2 style={{ marginBottom: '1.5rem', color: '#dc3545' }}>
-              <i>⚠️</i> Conflitti Tecnici
+            <h2 style={{ marginBottom: '1rem', color: '#dc3545' }}>
+              <i>⚠️</i> {t('conflictsTitle')}
             </h2>
-            
-            <div style={{
-              backgroundColor: '#fff3cd',
-              border: '1px solid #ffc107',
-              borderRadius: '5px',
-              padding: '1rem',
-              marginBottom: '1.5rem'
-            }}>
-              <strong>ℹ️ Info:</strong> Questa pagina mostra i tecnici assegnati a più attività negli stessi giorni.
-            </div>
 
             {(() => {
-              const conflicts = detectConflicts();
-              const byTechnician = {};
-              
-              conflicts.forEach(c => {
-                if (!byTechnician[c.technicianId]) {
-                  byTechnician[c.technicianId] = { name: c.technicianName, conflicts: [] };
+              const byTech = new Map();
+              detectedConflicts.forEach(cf => {
+                if (!byTech.has(cf.technicianId)) {
+                  byTech.set(cf.technicianId, { id: cf.technicianId, name: cf.technicianName, conflicts: [] });
                 }
-                byTechnician[c.technicianId].conflicts.push(c);
+                byTech.get(cf.technicianId).conflicts.push(cf);
               });
 
-              if (conflicts.length === 0) {
+              const q = conflictSearch.trim().toLowerCase();
+              const list = [...byTech.values()]
+                .filter(t => !q || t.name.toLowerCase().includes(q))
+                .sort((a, b) => b.conflicts.length - a.conflicts.length);
+
+              if (byTech.size === 0 && absenceIssues.size === 0) {
                 return (
                   <div style={{
-                    backgroundColor: '#d4edda',
-                    border: '1px solid #c3e6cb',
-                    borderRadius: '5px',
-                    padding: '1rem',
-                    color: '#155724'
+                    backgroundColor: 'var(--surface2)', border: '1px solid var(--border)',
+                    borderRadius: 5, padding: '1rem', color: 'var(--fg)'
                   }}>
-                    ✅ Nessun conflitto trovato! Tutti i tecnici hanno assegnazioni coerenti.
+                    ✅ {t('noConflicts')}
                   </div>
                 );
               }
 
-              return Object.values(byTechnician).map(tech => (
-                <div key={tech.name} style={{
-                  border: '1px solid #dc3545',
-                  borderLeft: '4px solid #dc3545',
-                  borderRadius: '5px',
-                  padding: '1.5rem',
-                  marginBottom: '1.5rem',
-                  backgroundColor: '#fff5f5'
-                }}>
-                  <h4 style={{ color: '#dc3545', marginBottom: '1rem' }}>
-                    👤 {tech.name} 
-                    <span style={{
-                      marginLeft: '1rem',
-                      backgroundColor: '#dc3545',
-                      color: 'white',
-                      padding: '0.25rem 0.75rem',
-                      borderRadius: '12px',
-                      fontSize: '0.85rem'
-                    }}>
-                      {tech.conflicts.length} conflitt{tech.conflicts.length > 1 ? 'i' : 'o'}
+              return (
+                <>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap' }}>
+                    <input
+                      type="text"
+                      value={conflictSearch}
+                      onChange={(e) => setConflictSearch(e.target.value)}
+                      placeholder={t('searchTechnician')}
+                      style={{ padding: '6px 10px', fontSize: 13, border: '1px solid var(--border)', borderRadius: 5, minWidth: 200 }}
+                    />
+                    <span style={{ fontSize: 13, color: 'var(--muted)' }}>
+                      {list.length} {t('techWithOverlaps')}
                     </span>
-                  </h4>
-                  
-                  {tech.conflicts.map((conflict, idx) => (
-                    <div key={idx} style={{
-                      border: '1px solid #ddd',
-                      borderRadius: '5px',
-                      padding: '1rem',
-                      marginBottom: '1rem',
-                      backgroundColor: 'white'
+                    <button
+                      onClick={() => setExpandedConflictTechs(
+                        expandedConflictTechs.length ? [] : list.map(t => t.id)
+                      )}
+                      style={{
+                        padding: '5px 12px', fontSize: 12, cursor: 'pointer',
+                        border: '1px solid var(--border)', borderRadius: 5, backgroundColor: 'var(--surface)',
+                      }}>
+                      {expandedConflictTechs.length ? t('collapseAll') : t('expandAll')}
+                    </button>
+                  </div>
+
+                  {/* Assenze sovrapposte ad attivita': elenco separato, il problema
+                      e' di natura diversa dalla doppia assegnazione */}
+                  {absenceIssues.size > 0 && (
+                    <div style={{
+                      border: '1px solid #f59e0b', borderRadius: 8,
+                      backgroundColor: 'var(--surface2)', padding: '10px 14px', marginBottom: '1rem',
                     }}>
-                      <h6 style={{ color: '#dc3545', marginBottom: '0.5rem' }}>
-                        📅 {new Date(conflict.date).toLocaleDateString('it-IT', { 
-                          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
-                        })}
-                      </h6>
-                      <p style={{ fontWeight: 'bold', marginBottom: '0.5rem' }}>Attività in conflitto:</p>
-                      <ul style={{ listStyle: 'none', padding: 0 }}>
-                        {conflict.activities.map(act => (
-                          <li key={act.id} style={{
-                            padding: '0.75rem',
-                            marginBottom: '0.5rem',
-                            border: '1px solid #e5e7eb',
-                            borderRadius: '5px',
-                            backgroundColor: '#f9fafb',
-                            cursor: 'pointer',
-                            transition: 'all 0.2s'
-                          }}
-                          onClick={() => {
-                            setEditingActivity(act);
-                            setSelectedTechnicians(act.technicians?.map(t => t.id) || []);
-                            setShowActivityModal(true);
-                          }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.backgroundColor = '#e5e7eb';
-                            e.currentTarget.style.borderColor = '#3b82f6';
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.backgroundColor = '#f9fafb';
-                            e.currentTarget.style.borderColor = '#e5e7eb';
-                          }}>
-                            <strong>{act.name}</strong><br/>
-                            <small style={{ color: '#6b7280' }}>
-                              {new Date(act.start_date).toLocaleDateString('it-IT')} - 
-                              {new Date(act.end_date).toLocaleDateString('it-IT')}
-                            </small>
-                            <span style={{
-                              marginLeft: '0.5rem',
-                              color: '#3b82f6',
-                              fontSize: '0.85rem'
-                            }}>
-                              ✏️ Clicca per modificare
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
+                      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: '#f59e0b' }}>
+                        🏖 {t('assignedDuringAbsence')}
+                      </div>
+                      {[...absenceIssues.entries()].map(([techName, items]) => (
+                        <div key={techName} style={{ marginBottom: 6, fontSize: 13 }}>
+                          <strong>{techName}</strong>
+                          <span style={{ color: 'var(--muted)' }}> — {items.length} {t('activitiesCol').toLowerCase()}</span>
+                          <div style={{ marginLeft: 14, fontSize: 12, color: 'var(--muted)' }}>
+                            {items.map((it, i) => (
+                              <div key={i}>
+                                {it.activity.name} · {new Date(it.activity.start_date).toLocaleDateString(locale)}
+                                {' — '}{t('abs_' + it.absence.type)}{' '}
+                                {new Date(it.absence.from).toLocaleDateString(locale)}
+                                {' → '}{new Date(it.absence.to).toLocaleDateString(locale)}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-              ));
+                  )}
+
+                  {/* Elenco scorrevole: un tecnico per riga, si apre al clic */}
+                  <div style={{ maxHeight: 'calc(100vh - 320px)', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 8 }}>
+                    {list.map(tech => {
+                      const open = expandedConflictTechs.includes(tech.id);
+                      const totAct = new Set(tech.conflicts.flatMap(cf => cf.activities.map(a => a.id))).size;
+                      return (
+                        <div key={tech.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                          {/* Intestazione tecnico */}
+                          <div
+                            onClick={() => setExpandedConflictTechs(prev =>
+                              prev.includes(tech.id) ? prev.filter(x => x !== tech.id) : [...prev, tech.id]
+                            )}
+                            style={{
+                              display: 'flex', alignItems: 'center', gap: 10,
+                              padding: '12px 16px', cursor: 'pointer',
+                              backgroundColor: open ? 'var(--surface2)' : 'var(--surface)',
+                            }}>
+                            {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                            <strong style={{ color: '#dc3545' }}>{tech.name}</strong>
+                            <span style={{
+                              backgroundColor: '#dc3545', color: 'white',
+                              padding: '2px 10px', borderRadius: 12, fontSize: 12,
+                            }}>
+                              {tech.conflicts.length} {t('periods')}
+                            </span>
+                            <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                              {totAct} {t('involvedActivities')}
+                            </span>
+                          </div>
+
+                          {/* Dettaglio */}
+                          {open && (
+                            <div style={{ padding: '0 16px 16px 40px', backgroundColor: 'var(--surface2)' }}>
+                              {tech.conflicts.map((cf, idx) => (
+                                <div key={idx} style={{
+                                  border: '1px solid #f0d0d0', borderRadius: 5,
+                                  padding: '12px', marginBottom: 10, backgroundColor: 'var(--surface)',
+                                }}>
+                                  <div style={{ fontSize: 13, color: '#dc3545', fontWeight: 600, marginBottom: 8 }}>
+                                    📅 dal {new Date(cf.periodStart).toLocaleDateString(locale)} al {new Date(cf.periodEnd).toLocaleDateString(locale)}
+                                    <span style={{ marginLeft: 8, fontWeight: 400, color: 'var(--muted)' }}>
+                                      ({cf.activities.length} {t('overlappingActivities')})
+                                    </span>
+                                  </div>
+
+                                  {cf.activities.map(act => {
+                                    const prj = projectsById.get(act.project_id);
+                                    return (
+                                      <div key={act.id}
+                                        onClick={() => {
+                                          setEditingActivity(act);
+                                          setSelectedTechnicians(act.technicians?.map(t => t.id) || []);
+                                          setShowActivityModal(true);
+                                        }}
+                                        title={t('clickToEdit')}
+                                        style={{
+                                          display: 'flex', alignItems: 'center', gap: 10,
+                                          padding: '8px 10px', marginBottom: 6,
+                                          border: '1px solid var(--border)', borderRadius: 5,
+                                          backgroundColor: 'var(--surface2)', cursor: 'pointer',
+                                          borderLeft: `4px solid ${prj?.color || '#555555'}`,
+                                        }}
+                                        onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--surface2)'; }}
+                                        onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'var(--surface2)'; }}
+                                      >
+                                        <span style={{
+                                          fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                                          backgroundColor: prj?.color || '#555555', color: 'white', whiteSpace: 'nowrap',
+                                        }}>
+                                          {countryFlag(prj?.country)} {prj?.code || '—'}
+                                        </span>
+                                        <span style={{ flex: 1, fontSize: 13 }}>
+                                          <strong>{act.name}</strong>
+                                          <span style={{ color: 'var(--muted)' }}> · {prj?.name || 'Progetto sconosciuto'}</span>
+                                        </span>
+                                        <span style={{ fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>
+                                          {new Date(act.start_date).toLocaleDateString(locale)} → {new Date(act.end_date).toLocaleDateString(locale)}
+                                        </span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              );
             })()}
           </div>
         )}
@@ -1607,7 +2547,7 @@ const handleSaveActivity = async (activityData) => {
           zIndex: 1000
         }}>
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '10px',
             width: '90%',
@@ -1625,9 +2565,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -1641,22 +2583,47 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
+              </div>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Nazione</label>
+                <select
+                  value={editingProject?.country || 'IT'}
+                  onChange={(e) => setEditingProject({ ...editingProject, country: e.target.value })}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem',
+                    border: '1px solid var(--border)',
+                    borderRadius: '5px',
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)'
+                  }}
+                >
+                  {EMEA_COUNTRIES.map(g => (
+                    <optgroup key={g.group} label={g.group}>
+                      {g.items.map(([code, name]) => (
+                        <option key={code} value={code} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{countryFlag(code)} {name}</option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
               </div>
               <div style={{ marginBottom: '1rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Colore</label>
                 <input
                   type="color"
-                  value={editingProject?.color || '#3b82f6'}
+                  value={editingProject?.color || '#555555'}
                   onChange={(e) => setEditingProject({ ...editingProject, color: e.target.value })}
                   style={{
                     width: '100%',
                     height: '50px',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
                     cursor: 'pointer'
                   }}
@@ -1665,15 +2632,14 @@ const handleSaveActivity = async (activityData) => {
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
-                  disabled={dateError}
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: dateError ? '#c7c9d1' : '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
-                    cursor: dateError ? 'not-allowed' : 'pointer',
+                    cursor: 'pointer',
                     fontWeight: '600'
                   }}
                 >
@@ -1688,8 +2654,8 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#6b7280',
-                    color: 'white',
+                    backgroundColor: 'var(--muted)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -1719,7 +2685,7 @@ const handleSaveActivity = async (activityData) => {
           zIndex: 1000
         }}>
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '10px',
             width: '90%',
@@ -1737,9 +2703,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -1753,9 +2721,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -1769,9 +2739,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -1785,9 +2757,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -1795,12 +2769,12 @@ const handleSaveActivity = async (activityData) => {
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Colore</label>
                 <input
                   type="color"
-                  value={editingTechnician?.color || '#3b82f6'}
+                  value={editingTechnician?.color || '#555555'}
                   onChange={(e) => setEditingTechnician({ ...editingTechnician, color: e.target.value })}
                   style={{
                     width: '100%',
                     height: '50px',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
                     cursor: 'pointer'
                   }}
@@ -1809,15 +2783,14 @@ const handleSaveActivity = async (activityData) => {
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
-                  disabled={dateError}
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: dateError ? '#c7c9d1' : '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
-                    cursor: dateError ? 'not-allowed' : 'pointer',
+                    cursor: 'pointer',
                     fontWeight: '600'
                   }}
                 >
@@ -1832,8 +2805,8 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#6b7280',
-                    color: 'white',
+                    backgroundColor: 'var(--muted)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -1863,7 +2836,7 @@ const handleSaveActivity = async (activityData) => {
           zIndex: 1000
         }}>
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '10px',
             width: '90%',
@@ -1880,6 +2853,8 @@ const handleSaveActivity = async (activityData) => {
                 technician_ids: selectedTechnicians,
                 start_date: formStart,
                 end_date: formEnd,
+                start_half: formStartHalf,
+                end_half: formEndHalf,
                 progress: parseInt(formData.get('progress'))
               });
             }}>
@@ -1893,9 +2868,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -1908,14 +2885,16 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 >
-                  <option value="">Seleziona un progetto</option>
+                  <option value="" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>Seleziona un progetto</option>
                   {projects.map(p => (
-                    <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
+                    <option key={p.id} value={p.id} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{p.code} - {p.name}</option>
                   ))}
                 </select>
               </div>
@@ -1925,7 +2904,7 @@ const handleSaveActivity = async (activityData) => {
 
 		<div style={{ marginBottom: '1rem' }}>
   <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Tecnici</label>
-  <div style={{ border: '1px solid #ddd', borderRadius: '5px', padding: '10px', maxHeight: '150px', overflowY: 'auto' }}>
+  <div style={{ border: '1px solid var(--border)', borderRadius: '5px', padding: '10px', maxHeight: '150px', overflowY: 'auto' }}>
     {technicians.map(tech => (
       <div key={tech.id} style={{ marginBottom: '5px' }}>
         <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
@@ -1961,11 +2940,27 @@ const handleSaveActivity = async (activityData) => {
                     style={{
                       width: '100%',
                       padding: '0.5rem',
-                      border: '1px solid #ddd',
+                      border: '1px solid var(--border)',
                       borderRadius: '5px',
                       boxSizing: 'border-box'
                     }}
                   />
+                  <select
+                    value={formStartHalf}
+                    onChange={(e) => setFormStartHalf(e.target.value)}
+                    style={{
+                      width: '100%',
+                      marginTop: '0.4rem',
+                      padding: '0.5rem',
+                      border: '1px solid var(--border)',
+                      borderRadius: '5px',
+                      backgroundColor: 'var(--surface)',
+                      boxSizing: 'border-box'
+                    }}
+                  >
+                    <option value="AM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('morning')}</option>
+                    <option value="PM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('afternoon')}</option>
+                  </select>
                 </div>
                 <div style={{ flex: 1 }}>
                   <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Data Fine</label>
@@ -1979,23 +2974,39 @@ const handleSaveActivity = async (activityData) => {
                     style={{
                       width: '100%',
                       padding: '0.5rem',
-                      border: dateError ? '2px solid #ef4444' : '1px solid #ddd',
+                      border: dateError ? '2px solid #ef4444' : '1px solid var(--border)',
                       borderRadius: '5px',
                       boxSizing: 'border-box',
-                      backgroundColor: dateError ? '#fef2f2' : 'white'
+                      backgroundColor: dateError ? 'var(--surface2)' : 'white'
                     }}
                   />
+                  <select
+                    value={formEndHalf}
+                    onChange={(e) => setFormEndHalf(e.target.value)}
+                    style={{
+                      width: '100%',
+                      marginTop: '0.4rem',
+                      padding: '0.5rem',
+                      borderRadius: '5px',
+                      backgroundColor: dateError ? 'var(--surface2)' : 'white',
+                      border: dateError ? '2px solid #ef4444' : '1px solid var(--border)',
+                      boxSizing: 'border-box'
+                    }}
+                  >
+                    <option value="AM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('morning')}</option>
+                    <option value="PM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('afternoon')}</option>
+                  </select>
                 </div>
               </div>
 
               <div style={{ marginBottom: '1rem', minHeight: '20px' }}>
                 {dateError ? (
                   <span style={{ color: '#ef4444', fontSize: '0.85rem' }}>
-                    La data di fine non puo' precedere quella di inizio.
+                    {t('dateErrorMsg')}
                   </span>
                 ) : durationDays ? (
-                  <span style={{ color: '#6b7280', fontSize: '0.85rem' }}>
-                    Durata: {durationDays} {durationDays === 1 ? 'giorno' : 'giorni'} di calendario
+                  <span style={{ color: 'var(--muted)', fontSize: '0.85rem' }}>
+                    {t('duration')}: {durationDays} {durationDays === 1 ? t('oneDay') : t('calendarDays')}
                   </span>
                 ) : null}
               </div>
@@ -2011,9 +3022,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -2024,8 +3037,8 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: dateError ? '#c7c9d1' : '#667eea',
-                    color: 'white',
+                    backgroundColor: dateError ? 'var(--muted)' : 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: dateError ? 'not-allowed' : 'pointer',
@@ -2045,8 +3058,8 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#6b7280',
-                    color: 'white',
+                    backgroundColor: 'var(--muted)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -2062,6 +3075,417 @@ const handleSaveActivity = async (activityData) => {
       )}
 
       {/* Modal Utenti */}
+      {/* Manutenzione e registro — visibili solo agli admin */}
+      {currentView === 'system' && user?.role === 'admin' && (
+        <div style={{ padding: '0 1rem 1rem 1rem' }}>
+          <h2 style={{ margin: '0 0 0.25rem 0' }}>🗄 {t('maintenance')}</h2>
+          <p style={{ margin: '0 0 1rem 0', fontSize: 13, color: 'var(--muted)' }}>
+            {t('maintenanceHint')}
+          </p>
+
+          <div style={{
+            backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 8, padding: '1rem',
+          }}>
+            <h3 style={{ marginTop: 0, fontSize: '1rem' }}>💾 {t('backupSection')}</h3>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+              <button onClick={handleBackup}
+                style={{
+                  padding: '7px 14px', backgroundColor: 'var(--accent)', color: 'var(--accentFg)',
+                  border: 'none', borderRadius: 5, cursor: 'pointer', fontWeight: 600, fontSize: 13,
+                }}>
+                ⬇ {t('backupNow')}
+              </button>
+
+              <label style={{
+                padding: '7px 14px', border: '1px solid #ef4444', color: '#ef4444',
+                borderRadius: 5, cursor: restoring ? 'wait' : 'pointer', fontSize: 13,
+              }}>
+                ⬆ {restoring ? t('restoring') : t('restore')}
+                <input type="file" accept="application/json" disabled={restoring}
+                  onChange={(e) => { handleRestore(e.target.files?.[0]); e.target.value = ''; }}
+                  style={{ display: 'none' }} />
+              </label>
+
+              <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('backupHint')}</span>
+            </div>
+          </div>
+
+          <div style={{
+            backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 8, padding: '1rem', marginTop: '1rem',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>📝 {t('changeLog')}</h3>
+              <button onClick={() => fetchAudit(auditPage)}
+                title={t('refresh')}
+                style={{
+                  padding: '4px 12px', fontSize: 12, cursor: 'pointer',
+                  border: '1px solid var(--border)', borderRadius: 5,
+                  background: 'transparent', color: 'var(--fg)',
+                }}>
+                ↻ {t('refresh')}
+              </button>
+              {auditTotal > 0 && (
+                <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                  {auditPage * 50 + 1}–{Math.min((auditPage + 1) * 50, auditTotal)} {t('of')} {auditTotal}
+                </span>
+              )}
+            </div>
+
+            {auditRows.length === 0 && (
+              <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>
+                {t('noChanges')}
+              </div>
+            )}
+
+            {auditRows.length > 0 && (
+              <>
+                <div style={{ maxHeight: 380, overflow: 'auto', border: '1px solid var(--border)', borderRadius: 6 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead>
+                      <tr>
+                        {[t('date'), t('user'), t('action'), t('entity'), t('details')].map((h, i) => (
+                          <th key={i} style={{
+                            textAlign: 'left', padding: '7px 10px', backgroundColor: 'var(--surface2)',
+                            borderBottom: '2px solid var(--border)', position: 'sticky', top: 0,
+                          }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {auditRows.map(r => (
+                        <tr key={r.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                          <td style={{ padding: '6px 10px', whiteSpace: 'nowrap' }}>
+                            {new Date(r.created_at).toLocaleString(locale)}
+                          </td>
+                          <td style={{ padding: '6px 10px' }}>{r.user_name || '—'}</td>
+                          <td style={{ padding: '6px 10px' }}>
+                            <span style={{
+                              padding: '1px 7px', borderRadius: 10, fontSize: 11,
+                              border: '1px solid var(--border)',
+                              color: r.action === 'delete' ? '#ef4444' : 'var(--fg)',
+                            }}>{t('act_' + r.action) || r.action}</span>
+                          </td>
+                          <td style={{ padding: '6px 10px' }}>
+                            {r.country ? countryFlag(r.country) + ' ' : ''}{r.entity_label || r.entity_type}
+                          </td>
+                          <td style={{ padding: '6px 10px', color: 'var(--muted)' }}>
+                            {r.details ? Object.entries(r.details).map(([k, v]) =>
+                              `${k}: ${Array.isArray(v) ? v.join(' → ') : v}`).join(' · ') : ''}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                  <button onClick={() => fetchAudit(Math.max(0, auditPage - 1))} disabled={auditPage === 0}
+                    style={{
+                      padding: '5px 12px', fontSize: 12, borderRadius: 5,
+                      border: '1px solid var(--border)', background: 'transparent',
+                      color: auditPage === 0 ? 'var(--muted)' : 'var(--fg)',
+                      cursor: auditPage === 0 ? 'not-allowed' : 'pointer',
+                    }}>{t('previousPage')}</button>
+                  <button onClick={() => fetchAudit(auditPage + 1)}
+                    disabled={(auditPage + 1) * 50 >= auditTotal}
+                    style={{
+                      padding: '5px 12px', fontSize: 12, borderRadius: 5,
+                      border: '1px solid var(--border)', background: 'transparent',
+                      color: (auditPage + 1) * 50 >= auditTotal ? 'var(--muted)' : 'var(--fg)',
+                      cursor: (auditPage + 1) * 50 >= auditTotal ? 'not-allowed' : 'pointer',
+                    }}>{t('nextPage')}</button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Accesso da telefono del tecnico */}
+      {showDeviceModal && deviceTech && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+        }}>
+          <div style={{
+            backgroundColor: 'var(--surface)', color: 'var(--fg)',
+            padding: '1.5rem', borderRadius: 8, width: '100%', maxWidth: 620,
+            maxHeight: '86vh', overflowY: 'auto', border: '1px solid var(--border)',
+          }}>
+            <h3 style={{ marginTop: 0 }}>📱 {t('deviceAccess')} — {deviceTech.name}</h3>
+            <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 0 }}>{t('deviceHint')}</p>
+
+            {/* Invito appena generato */}
+            {newInvite && (
+              <div style={{
+                border: '2px solid var(--accent)', borderRadius: 6,
+                padding: '0.9rem', marginBottom: '1rem', backgroundColor: 'var(--surface2)',
+              }}>
+                <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>
+                  ⚠ {t('inviteOnce')}
+                </div>
+                <input
+                  readOnly
+                  value={`${window.location.origin}/technician/#${newInvite.code}`}
+                  onFocus={(e) => e.target.select()}
+                  style={{
+                    width: '100%', padding: '7px 9px', fontSize: 12, fontFamily: 'monospace',
+                    border: '1px solid var(--border)', borderRadius: 5, boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }}
+                />
+                <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                  <button
+                    onClick={() => {
+                      const link = `${window.location.origin}/technician/#${newInvite.code}`;
+                      navigator.clipboard?.writeText(link).then(
+                        () => alert(t('linkCopied')),
+                        () => alert(link)
+                      );
+                    }}
+                    style={{
+                      padding: '5px 12px', fontSize: 12, cursor: 'pointer', borderRadius: 5,
+                      border: 'none', backgroundColor: 'var(--accent)', color: 'var(--accentFg)',
+                    }}>
+                    {t('copyLink')}
+                  </button>
+                  <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                    {t('expiresOn')} {new Date(newInvite.expires_at).toLocaleString(locale)}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            <button onClick={createInvite}
+              style={{
+                padding: '7px 14px', marginBottom: '1rem',
+                backgroundColor: newInvite ? 'transparent' : 'var(--accent)',
+                color: newInvite ? 'var(--fg)' : 'var(--accentFg)',
+                border: newInvite ? '1px solid var(--border)' : 'none',
+                borderRadius: 5, cursor: 'pointer', fontWeight: 600, fontSize: 13,
+              }}>
+              {newInvite ? t('newInvite') : t('generateInvite')}
+            </button>
+
+            {/* Dispositivi */}
+            <h4 style={{ margin: '0 0 8px 0', fontSize: '0.9rem' }}>{t('activeDevices')}</h4>
+            {devices.length === 0 ? (
+              <div style={{ fontSize: 13, color: 'var(--muted)' }}>{t('noDevices')}</div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr>
+                    {[t('device'), t('activatedOn'), t('lastSeen'), ''].map((h, i) => (
+                      <th key={i} style={{
+                        textAlign: 'left', padding: '6px 8px', fontSize: 12,
+                        backgroundColor: 'var(--surface2)', borderBottom: '2px solid var(--border)',
+                      }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {devices.map(d => (
+                    <tr key={d.id} style={{
+                      borderBottom: '1px solid var(--border)',
+                      opacity: d.revoked_at ? 0.5 : 1,
+                    }}>
+                      <td style={{ padding: '6px 8px' }}>
+                        {d.device_name}
+                        {d.revoked_at && (
+                          <span style={{ color: '#ef4444', fontSize: 11, marginLeft: 6 }}>({t('revoked')})</span>
+                        )}
+                      </td>
+                      <td style={{ padding: '6px 8px' }}>{new Date(d.activated_at).toLocaleDateString(locale)}</td>
+                      <td style={{ padding: '6px 8px', color: 'var(--muted)' }}>
+                        {d.last_seen ? new Date(d.last_seen).toLocaleString(locale) : '—'}
+                      </td>
+                      <td style={{ padding: '6px 8px', textAlign: 'right' }}>
+                        {!d.revoked_at && (
+                          <button onClick={() => revokeDevice(d.id)}
+                            style={{
+                              background: 'transparent', border: '1px solid var(--border)',
+                              borderRadius: 4, color: '#ef4444', cursor: 'pointer', padding: '2px 8px', fontSize: 12,
+                            }}>
+                            {t('revoke')}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            <div style={{ display: 'flex', marginTop: '1.2rem' }}>
+              <button
+                onClick={() => { setShowDeviceModal(false); setDeviceTech(null); setNewInvite(null); }}
+                style={{
+                  marginLeft: 'auto', padding: '7px 16px', background: 'transparent',
+                  color: 'var(--fg)', border: '1px solid var(--border)', borderRadius: 5, cursor: 'pointer',
+                }}>
+                {t('close')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Assenze del tecnico */}
+      {showAbsenceModal && absenceTech && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.5)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+        }}>
+          <div style={{
+            backgroundColor: 'var(--surface)', color: 'var(--fg)',
+            padding: '1.5rem', borderRadius: 8, width: '100%', maxWidth: 620,
+            maxHeight: '86vh', overflowY: 'auto', border: '1px solid var(--border)',
+          }}>
+            <h3 style={{ marginTop: 0 }}>
+              🏖 {t('absences')} — {absenceTech.name}
+            </h3>
+
+            {/* Elenco */}
+            {absences.filter(x => x.technician_id === absenceTech.id).length === 0 ? (
+              <div style={{ color: 'var(--muted)', fontSize: 13, margin: '1rem 0' }}>{t('noAbsences')}</div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginBottom: '1rem' }}>
+                <thead>
+                  <tr>
+                    {[t('period'), t('type'), t('daysCol'), ''].map((h, i) => (
+                      <th key={i} style={{
+                        textAlign: i === 2 ? 'right' : 'left', padding: '6px 8px',
+                        backgroundColor: 'var(--surface2)', borderBottom: '2px solid var(--border)', fontSize: 12,
+                      }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {absences
+                    .filter(x => x.technician_id === absenceTech.id)
+                    .sort((a, b) => new Date(b.start_date) - new Date(a.start_date))
+                    .map(ab => (
+                      <tr key={ab.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '6px 8px' }}>
+                          {new Date(ab.start_date).toLocaleDateString(locale)}
+                          {ab.start_half === 'PM' ? ` (${t('afternoon')})` : ''}
+                          {' → '}
+                          {new Date(ab.end_date).toLocaleDateString(locale)}
+                          {ab.end_half === 'AM' ? ` (${t('morning')})` : ''}
+                          {ab.note && <div style={{ fontSize: 11, color: 'var(--muted)' }}>{ab.note}</div>}
+                        </td>
+                        <td style={{ padding: '6px 8px' }}>{t('abs_' + ab.type)}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right' }}>{actDurationDays(ab)}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                          <button onClick={() => setEditingAbsence(ab)}
+                            style={{ background: 'transparent', border: '1px solid var(--border)', borderRadius: 4,
+                                     color: 'var(--fg)', cursor: 'pointer', padding: '2px 6px', marginRight: 4 }}>
+                            <Edit2 size={13} />
+                          </button>
+                          <button onClick={() => handleDeleteAbsence(ab.id)}
+                            style={{ background: 'transparent', border: '1px solid var(--border)', borderRadius: 4,
+                                     color: '#ef4444', cursor: 'pointer', padding: '2px 6px' }}>
+                            <Trash2 size={13} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            )}
+
+            {/* Nuova o modifica */}
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: '1rem' }}>
+              <strong style={{ fontSize: 13 }}>
+                {editingAbsence ? t('edit') : t('addAbsence')}
+              </strong>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8, alignItems: 'flex-end' }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: 11, color: 'var(--muted)' }}>{t('startDate')}</label>
+                  <input type="date"
+                    value={editingAbsence?.start_date ? formatDateForInput(editingAbsence.start_date) : (editingAbsence?.start_date || '')}
+                    onChange={(e) => setEditingAbsence({ ...(editingAbsence || {}), start_date: e.target.value })}
+                    style={{ padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5,
+                             backgroundColor: 'var(--surface)', color: 'var(--fg)' }} />
+                  <select value={editingAbsence?.start_half || 'AM'}
+                    onChange={(e) => setEditingAbsence({ ...(editingAbsence || {}), start_half: e.target.value })}
+                    style={{ marginLeft: 4, padding: '5px', border: '1px solid var(--border)', borderRadius: 5,
+                             backgroundColor: 'var(--surface)', color: 'var(--fg)' }}>
+                    <option value="AM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('morning')}</option>
+                    <option value="PM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('afternoon')}</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={{ display: 'block', fontSize: 11, color: 'var(--muted)' }}>{t('endDate')}</label>
+                  <input type="date"
+                    value={editingAbsence?.end_date ? formatDateForInput(editingAbsence.end_date) : (editingAbsence?.end_date || '')}
+                    onChange={(e) => setEditingAbsence({ ...(editingAbsence || {}), end_date: e.target.value })}
+                    style={{ padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5,
+                             backgroundColor: 'var(--surface)', color: 'var(--fg)' }} />
+                  <select value={editingAbsence?.end_half || 'PM'}
+                    onChange={(e) => setEditingAbsence({ ...(editingAbsence || {}), end_half: e.target.value })}
+                    style={{ marginLeft: 4, padding: '5px', border: '1px solid var(--border)', borderRadius: 5,
+                             backgroundColor: 'var(--surface)', color: 'var(--fg)' }}>
+                    <option value="AM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('morning')}</option>
+                    <option value="PM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('afternoon')}</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={{ display: 'block', fontSize: 11, color: 'var(--muted)' }}>{t('type')}</label>
+                  <select value={editingAbsence?.type || 'vacation'}
+                    onChange={(e) => setEditingAbsence({ ...(editingAbsence || {}), type: e.target.value })}
+                    style={{ padding: '5px 8px', border: '1px solid var(--border)', borderRadius: 5,
+                             backgroundColor: 'var(--surface)', color: 'var(--fg)' }}>
+                    {['vacation', 'sick', 'leave', 'training'].map(k => (
+                      <option key={k} value={k} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('abs_' + k)}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <input type="text" placeholder={t('note')}
+                value={editingAbsence?.note || ''}
+                onChange={(e) => setEditingAbsence({ ...(editingAbsence || {}), note: e.target.value })}
+                style={{ width: '100%', marginTop: 8, padding: '5px 8px', border: '1px solid var(--border)',
+                         borderRadius: 5, backgroundColor: 'var(--surface)', color: 'var(--fg)', boxSizing: 'border-box' }} />
+
+              <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                <button
+                  onClick={() => {
+                    const a = editingAbsence || {};
+                    if (!a.start_date || !a.end_date) { alert(t('dateRequired')); return; }
+                    handleSaveAbsence({
+                      technician_id: absenceTech.id,
+                      start_date: a.start_date, end_date: a.end_date,
+                      start_half: a.start_half || 'AM', end_half: a.end_half || 'PM',
+                      type: a.type || 'vacation', note: a.note || null,
+                    });
+                  }}
+                  style={{ padding: '7px 16px', backgroundColor: 'var(--accent)', color: 'var(--accentFg)',
+                           border: 'none', borderRadius: 5, cursor: 'pointer', fontWeight: 600 }}>
+                  {t('save')}
+                </button>
+                {editingAbsence && (
+                  <button onClick={() => setEditingAbsence(null)}
+                    style={{ padding: '7px 16px', background: 'transparent', color: 'var(--fg)',
+                             border: '1px solid var(--border)', borderRadius: 5, cursor: 'pointer' }}>
+                    {t('cancel')}
+                  </button>
+                )}
+                <button
+                  onClick={() => { setShowAbsenceModal(false); setEditingAbsence(null); setAbsenceTech(null); }}
+                  style={{ marginLeft: 'auto', padding: '7px 16px', background: 'transparent', color: 'var(--fg)',
+                           border: '1px solid var(--border)', borderRadius: 5, cursor: 'pointer' }}>
+                  {t('close')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showUserModal && (
         <div style={{
           position: 'fixed',
@@ -2076,7 +3500,7 @@ const handleSaveActivity = async (activityData) => {
           zIndex: 1000
         }}>
           <div style={{
-            backgroundColor: 'white',
+            backgroundColor: 'var(--surface)',
             padding: '2rem',
             borderRadius: '10px',
             width: '90%',
@@ -2094,9 +3518,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -2110,25 +3536,30 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Telefono</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>
+                  Telefono <span style={{ fontWeight: 400, color: 'var(--muted)' }}>({t('optional')})</span>
+                </label>
                 <input
                   type="tel"
-                  value={editingUser ? editingUser.phone : newUser.phone}
+                  value={(editingUser ? editingUser.phone : newUser.phone) || ''}
                   onChange={(e) => editingUser ? setEditingUser({ ...editingUser, phone: e.target.value }) : setNewUser({ ...newUser, phone: e.target.value })}
-                  required
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -2144,9 +3575,11 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 />
               </div>
@@ -2160,24 +3593,80 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     width: '100%',
                     padding: '0.5rem',
-                    border: '1px solid #ddd',
+                    border: '1px solid var(--border)',
                     borderRadius: '5px',
-                    boxSizing: 'border-box'
+                    boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)',
+                    color: 'var(--fg)'
                   }}
                 >
-                  <option value="viewer">Viewer</option>
-                  <option value="editor">Editor</option>
-                  <option value="admin">Admin</option>
+                  <option value="viewer" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>Viewer</option>
+                  <option value="editor" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>Editor</option>
+                  <option value="admin" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>Admin</option>
                 </select>
               </div>
+
+              {/* Aree assegnate: solo per gli editor. Gli admin scrivono ovunque,
+                  i viewer non scrivono affatto, quindi per loro il campo non ha senso. */}
+              {(editingUser ? editingUser.role : newUser.role) === 'editor' && (
+                <div style={{ marginBottom: '1rem' }}>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>
+                    {t('assignedAreas')}
+                  </label>
+                  <div style={{
+                    border: '1px solid var(--border)', borderRadius: 5, padding: '0.6rem',
+                    maxHeight: 240, overflowY: 'auto', backgroundColor: 'var(--surface2)',
+                  }}>
+                    {EMEA_COUNTRIES.map(g => {
+                      // Tutte le nazioni EMEA, non solo quelle con progetti esistenti:
+                      // serve poter assegnare un'area prima che ci lavori qualcuno.
+                      // Un puntino segnala dove ci sono gia' progetti.
+                      return (
+                        <div key={g.group} style={{ marginBottom: 8 }}>
+                          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>{g.group}</div>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                            {g.items.map(([cc, label]) => {
+                              const sel = (editingUser ? (editingUser.countries || []) : newUser.countries).includes(cc);
+                              return (
+                                <button key={cc} type="button"
+                                  onClick={() => {
+                                    const cur = editingUser ? (editingUser.countries || []) : newUser.countries;
+                                    const next = sel ? cur.filter(x => x !== cc) : [...cur, cc];
+                                    if (editingUser) setEditingUser({ ...editingUser, countries: next });
+                                    else setNewUser({ ...newUser, countries: next });
+                                  }}
+                                  title={label + (availableCountries.includes(cc) ? '' : ' — nessun progetto')}
+                                  style={{
+                                    padding: '4px 10px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                                    border: sel ? '1px solid var(--accent)' : '1px solid var(--border)',
+                                    backgroundColor: sel ? 'var(--accent)' : 'var(--surface)',
+                                    color: sel ? 'var(--accentFg)' : 'var(--fg)',
+                                    opacity: sel || availableCountries.includes(cc) ? 1 : 0.55,
+                                  }}>
+                                  {countryFlag(cc)} {cc}{availableCountries.includes(cc) ? ' •' : ''}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 6 }}>
+                    {((editingUser ? (editingUser.countries || []) : newUser.countries).length === 0)
+                      ? t('noAreasWarning')
+                      : t('areasHint')}
+                  </div>
+                </div>
+              )}
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#667eea',
-                    color: 'white',
+                    backgroundColor: 'var(--accent)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',
@@ -2195,8 +3684,8 @@ const handleSaveActivity = async (activityData) => {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    backgroundColor: '#6b7280',
-                    color: 'white',
+                    backgroundColor: 'var(--muted)',
+                    color: 'var(--accentFg)',
                     border: 'none',
                     borderRadius: '5px',
                     cursor: 'pointer',

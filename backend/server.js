@@ -3,6 +3,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,7 +19,7 @@ const pool = new Pool({
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
@@ -44,6 +45,65 @@ const authorize = (roles) => {
     }
     next();
   };
+};
+
+// Aree assegnate a un editor. Gli admin non hanno righe in user_countries:
+// per loro il controllo non si applica.
+const getUserCountries = async (userId) => {
+  const r = await pool.query('SELECT country FROM user_countries WHERE user_id = $1', [userId]);
+  return r.rows.map(x => x.country);
+};
+
+// Verifica che l'utente possa scrivere su una certa nazione.
+// Va nel backend e non solo nell'interfaccia: nascondere un pulsante non
+// impedisce a nessuno di chiamare l'API a mano.
+const canWriteCountry = async (user, country) => {
+  if (user.role === 'admin') return true;
+  if (user.role !== 'editor') return false;
+  const areas = await getUserCountries(user.id);
+  if (areas.length === 0) return false; // editor senza aree: nessuna scrittura
+  return areas.includes(country);
+};
+
+const countryOfProject = async (projectId) => {
+  const r = await pool.query('SELECT country FROM projects WHERE id = $1', [projectId]);
+  return r.rows[0]?.country || null;
+};
+
+const countryOfActivity = async (activityId) => {
+  const r = await pool.query(
+    'SELECT p.country FROM activities a JOIN projects p ON p.id = a.project_id WHERE a.id = $1',
+    [activityId]
+  );
+  return r.rows[0]?.country || null;
+};
+
+// Scrive nel registro senza mai far fallire l'operazione principale:
+// un problema nel log non deve impedire di salvare un progetto.
+const logAudit = async (req, { action, entityType, entityId, entityLabel, country, details }) => {
+  try {
+    await pool.query(
+      `INSERT INTO audit_log (user_id, user_name, user_email, action, entity_type, entity_id, entity_label, country, details)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [req.user?.id || null, req.user?.name || null, req.user?.email || null,
+       action, entityType, entityId || null, entityLabel || null, country || null,
+       details ? JSON.stringify(details) : null]
+    );
+  } catch (e) {
+    console.error('Audit log non scritto:', e.message);
+  }
+};
+
+// Confronta prima e dopo, tenendo solo i campi cambiati
+const diffFields = (before, after, fields) => {
+  const d = {};
+  fields.forEach(f => {
+    const b = before?.[f];
+    const a = after?.[f];
+    const norm = (v) => (v instanceof Date ? v.toISOString().split('T')[0] : v);
+    if (String(norm(b) ?? '') !== String(norm(a) ?? '')) d[f] = [norm(b) ?? null, norm(a) ?? null];
+  });
+  return Object.keys(d).length ? d : null;
 };
 
 // Initialize database
@@ -106,6 +166,122 @@ const initDB = async () => {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS technician_id INTEGER REFERENCES technicians(id);
     `);
 
+    // Multi-country: nazione del progetto, base del tecnico, aree assegnate agli editor.
+    // Il backfill di projects.country dal prefisso del codice (es. "ES-0117" -> "ES")
+    // gira SOLO alla creazione della colonna, per non sovrascrivere modifiche manuali.
+    const hasCountry = await pool.query(`
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'projects' AND column_name = 'country'
+    `);
+    if (hasCountry.rows.length === 0) {
+      await pool.query(`ALTER TABLE projects ADD COLUMN country CHAR(2) DEFAULT 'IT'`);
+      await pool.query(`
+        UPDATE projects
+        SET country = UPPER(SUBSTRING(code FROM 1 FOR 2))
+        WHERE code ~ '^[A-Za-z]{2}-'
+      `);
+      console.log('Migrazione: projects.country creata e popolata dal prefisso del codice');
+    }
+
+    await pool.query(`
+      ALTER TABLE technicians ADD COLUMN IF NOT EXISTS home_country CHAR(2) DEFAULT 'IT';
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_countries (
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        country CHAR(2) NOT NULL,
+        PRIMARY KEY (user_id, country)
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_projects_country ON projects(country);
+    `);
+
+    // Registro delle modifiche. Una riga per operazione di scrittura: pesa
+    // circa 260 byte, quindi anche con uso intenso resta nell'ordine dei MB/anno.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER,
+        user_name VARCHAR(255),
+        user_email VARCHAR(255),
+        action VARCHAR(20) NOT NULL,
+        entity_type VARCHAR(30) NOT NULL,
+        entity_id INTEGER,
+        entity_label VARCHAR(500),
+        country CHAR(2),
+        details JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Assenze dei tecnici. Tabella separata dalle attivita': un'assenza non ha
+    // progetto ne' avanzamento, e va trattata diversamente nei conflitti.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS technician_absences (
+        id SERIAL PRIMARY KEY,
+        technician_id INTEGER REFERENCES technicians(id) ON DELETE CASCADE,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        start_half CHAR(2) DEFAULT 'AM',
+        end_half CHAR(2) DEFAULT 'PM',
+        type VARCHAR(20) NOT NULL DEFAULT 'vacation',
+        note TEXT,
+        created_by INTEGER REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Accesso dei tecnici senza password: un invito monouso attiva il dispositivo,
+    // che da quel momento conserva un token. Niente password significa niente
+    // recupero password, che senza un server di posta sarebbe impraticabile.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS technician_invites (
+        id SERIAL PRIMARY KEY,
+        technician_id INTEGER REFERENCES technicians(id) ON DELETE CASCADE,
+        code_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used_at TIMESTAMP,
+        created_by INTEGER REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS technician_devices (
+        id SERIAL PRIMARY KEY,
+        technician_id INTEGER REFERENCES technicians(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL UNIQUE,
+        device_name VARCHAR(120),
+        activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP,
+        revoked_at TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_devices_tech  ON technician_devices(technician_id);
+      CREATE INDEX IF NOT EXISTS idx_devices_token ON technician_devices(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_invites_tech  ON technician_invites(technician_id);
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_absences_tech  ON technician_absences(technician_id);
+      CREATE INDEX IF NOT EXISTS idx_absences_dates ON technician_absences(start_date, end_date);
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_user    ON audit_log(user_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_entity  ON audit_log(entity_type, entity_id);
+    `);
+
+    // Mezze giornate: start_half AM/PM indica se l'attivita' parte a inizio mattina
+    // o dopo pranzo; end_half AM/PM se termina a mezzogiorno o a fine giornata.
+    // Default = giornata intera, cosi' i dati esistenti restano validi.
+    await pool.query(`
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS start_half CHAR(2) DEFAULT 'AM';
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS end_half CHAR(2) DEFAULT 'PM';
+    `);
+
     // Indici: necessari con centinaia di progetti e migliaia di attivita'
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_activities_project  ON activities(project_id);
@@ -131,12 +307,26 @@ const initDB = async () => {
 };
 
 // Validazione date attivita': il form e' cosmetico, l'API va protetta comunque.
-const validateActivityDates = (start_date, end_date) => {
+// Tutto il calcolo avviene in unita' di MEZZA GIORNATA: un giorno vale 2 unita'.
+// Cosi' un intervento che finisce martedi' mattina e uno che inizia martedi'
+// pomeriggio non risultano sovrapposti.
+const halfDayUnit = (dateStr, half, isEnd) => {
+  const days = Math.floor(new Date(dateStr).getTime() / 86400000);
+  if (isEnd) return days * 2 + (half === 'AM' ? 0 : 1);
+  return days * 2 + (half === 'PM' ? 1 : 0);
+};
+
+const validateActivityDates = (start_date, end_date, start_half, end_half) => {
   if (!start_date || !end_date) return 'Data di inizio e data di fine sono obbligatorie';
   const s = new Date(start_date);
   const e = new Date(end_date);
   if (isNaN(s.getTime()) || isNaN(e.getTime())) return 'Formato data non valido';
-  if (e < s) return 'La data di fine non puo\' precedere quella di inizio';
+
+  const sh = start_half === 'PM' ? 'PM' : 'AM';
+  const eh = end_half === 'AM' ? 'AM' : 'PM';
+  if (halfDayUnit(end_date, eh, true) < halfDayUnit(start_date, sh, false)) {
+    return 'La fine non puo\' precedere l\'inizio';
+  }
   return null;
 };
 
@@ -201,7 +391,9 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
       return res.status(404).json({ message: 'Utente non trovato' });
     }
     
-    res.json(result.rows[0]);
+    const me = result.rows[0];
+    const areas = await getUserCountries(me.id);
+    res.json({ ...me, countries: areas });
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ message: 'Errore durante il recupero dell\'utente' });
@@ -211,7 +403,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 // PROJECTS
 app.get('/api/projects', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM projects ORDER BY created_at DESC');
+    const result = await pool.query('SELECT * FROM projects ORDER BY country, code');
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching projects:', error);
@@ -220,14 +412,24 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/projects', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
-  const { code, name, color } = req.body;
-  
+  const { code, name, color, country } = req.body;
+  const cc = (country || 'IT').toUpperCase();
+
+  if (!(await canWriteCountry(req.user, cc))) {
+    return res.status(403).json({ message: `Non puoi creare progetti per la nazione ${cc}` });
+  }
+
   try {
     const result = await pool.query(
-      'INSERT INTO projects (code, name, color) VALUES ($1, $2, $3) RETURNING *',
-      [code, name, color || '#3b82f6']
+      'INSERT INTO projects (code, name, color, country) VALUES ($1, $2, $3, $4) RETURNING *',
+      [code, name, color || '#3b82f6', cc]
     );
-    res.status(201).json(result.rows[0]);
+    const p = result.rows[0];
+    await logAudit(req, {
+      action: 'create', entityType: 'project', entityId: p.id,
+      entityLabel: `${p.code} - ${p.name}`, country: p.country,
+    });
+    res.status(201).json(p);
   } catch (error) {
     console.error('Error creating project:', error);
     res.status(500).json({ message: 'Errore durante la creazione del progetto' });
@@ -236,14 +438,33 @@ app.post('/api/projects', authenticateToken, authorize(['admin', 'editor']), asy
 
 app.put('/api/projects/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
-  const { code, name, color } = req.body;
-  
+  const { code, name, color, country } = req.body;
+
   try {
+    const prev = (await pool.query('SELECT * FROM projects WHERE id = $1', [id])).rows[0];
+    if (!prev) return res.status(404).json({ message: 'Progetto non trovato' });
+
+    // Serve il permesso sia sulla nazione attuale sia su quella di destinazione:
+    // altrimenti si potrebbe spostare un progetto fuori dalla propria area.
+    if (!(await canWriteCountry(req.user, prev.country))) {
+      return res.status(403).json({ message: `Non puoi modificare progetti della nazione ${prev.country}` });
+    }
+    const newCC = country ? country.toUpperCase() : prev.country;
+    if (newCC !== prev.country && !(await canWriteCountry(req.user, newCC))) {
+      return res.status(403).json({ message: `Non puoi spostare il progetto nella nazione ${newCC}` });
+    }
+
     const result = await pool.query(
-      'UPDATE projects SET code = $1, name = $2, color = $3 WHERE id = $4 RETURNING *',
-      [code, name, color, id]
+      'UPDATE projects SET code = $1, name = $2, color = $3, country = COALESCE($4, country) WHERE id = $5 RETURNING *',
+      [code, name, color, country ? country.toUpperCase() : null, id]
     );
-    res.json(result.rows[0]);
+    const p = result.rows[0];
+    const details = diffFields(prev, p, ['code', 'name', 'color', 'country']);
+    await logAudit(req, {
+      action: 'update', entityType: 'project', entityId: p.id,
+      entityLabel: `${p.code} - ${p.name}`, country: p.country, details,
+    });
+    res.json(p);
   } catch (error) {
     console.error('Error updating project:', error);
     res.status(500).json({ message: 'Errore durante l\'aggiornamento del progetto' });
@@ -252,9 +473,16 @@ app.put('/api/projects/:id', authenticateToken, authorize(['admin', 'editor']), 
 
 app.delete('/api/projects/:id', authenticateToken, authorize(['admin']), async (req, res) => {
   const { id } = req.params;
-  
+
   try {
+    const prev = (await pool.query('SELECT * FROM projects WHERE id = $1', [id])).rows[0];
     await pool.query('DELETE FROM projects WHERE id = $1', [id]);
+    if (prev) {
+      await logAudit(req, {
+        action: 'delete', entityType: 'project', entityId: prev.id,
+        entityLabel: `${prev.code} - ${prev.name}`, country: prev.country,
+      });
+    }
     res.json({ message: 'Progetto eliminato' });
   } catch (error) {
     console.error('Error deleting project:', error);
@@ -288,11 +516,18 @@ app.get('/api/activities', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
-  const { name, project_id, technician_ids, start_date, end_date, progress } = req.body;
+  const { name, project_id, technician_ids, start_date, end_date, progress, start_half, end_half } = req.body;
+  const sHalf = start_half === 'PM' ? 'PM' : 'AM';
+  const eHalf = end_half === 'AM' ? 'AM' : 'PM';
 
-  const dateError = validateActivityDates(start_date, end_date);
+  const dateError = validateActivityDates(start_date, end_date, sHalf, eHalf);
   if (dateError) {
     return res.status(400).json({ message: dateError });
+  }
+
+  const cc = await countryOfProject(project_id);
+  if (!(await canWriteCountry(req.user, cc))) {
+    return res.status(403).json({ message: `Non puoi creare attività per la nazione ${cc || '—'}` });
   }
 
   const client = await pool.connect();
@@ -301,8 +536,8 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
     
     // Crea l'attività
     const result = await client.query(
-      'INSERT INTO activities (name, project_id, start_date, end_date, progress) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, project_id, start_date, end_date, progress || 0]
+      'INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [name, project_id, start_date, end_date, progress || 0, sHalf, eHalf]
     );
     
     const activity = result.rows[0];
@@ -318,6 +553,11 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
     }
     
     await client.query('COMMIT');
+    await logAudit(req, {
+      action: 'create', entityType: 'activity', entityId: activity.id,
+      entityLabel: activity.name, country: cc,
+      details: { start_date, end_date, technicians: (technician_ids || []).length },
+    });
     res.status(201).json(activity);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -330,11 +570,23 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
 
 app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
-  const { name, project_id, technician_ids, start_date, end_date, progress } = req.body;
+  const { name, project_id, technician_ids, start_date, end_date, progress, start_half, end_half } = req.body;
+  const sHalf = start_half === 'PM' ? 'PM' : 'AM';
+  const eHalf = end_half === 'AM' ? 'AM' : 'PM';
 
-  const dateError = validateActivityDates(start_date, end_date);
+  const dateError = validateActivityDates(start_date, end_date, sHalf, eHalf);
   if (dateError) {
     return res.status(400).json({ message: dateError });
+  }
+
+  // Serve il permesso sia sul progetto attuale sia su quello di destinazione
+  const prevCC = await countryOfActivity(id);
+  const newCC = await countryOfProject(project_id);
+  if (!(await canWriteCountry(req.user, prevCC))) {
+    return res.status(403).json({ message: `Non puoi modificare attività della nazione ${prevCC || '—'}` });
+  }
+  if (newCC !== prevCC && !(await canWriteCountry(req.user, newCC))) {
+    return res.status(403).json({ message: `Non puoi spostare l'attività nella nazione ${newCC || '—'}` });
   }
 
   const client = await pool.connect();
@@ -343,8 +595,8 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
     
     // Aggiorna l'attività
     const result = await client.query(
-      'UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5 WHERE id = $6 RETURNING *',
-      [name, project_id, start_date, end_date, progress, id]
+      'UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5, start_half = $6, end_half = $7 WHERE id = $8 RETURNING *',
+      [name, project_id, start_date, end_date, progress, sHalf, eHalf, id]
     );
     
     // Rimuovi vecchie associazioni
@@ -361,7 +613,13 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
     }
     
     await client.query('COMMIT');
-    res.json(result.rows[0]);
+    const upd = result.rows[0];
+    await logAudit(req, {
+      action: 'update', entityType: 'activity', entityId: upd.id,
+      entityLabel: upd.name, country: newCC,
+      details: { start_date: upd.start_date, end_date: upd.end_date, progress: upd.progress },
+    });
+    res.json(upd);
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error updating activity:', error);
@@ -371,11 +629,26 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
   }
 });
 
-app.delete('/api/activities/:id', authenticateToken, authorize(['admin']), async (req, res) => {
+app.delete('/api/activities/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
-  
+
   try {
+    const prev = (await pool.query(
+      `SELECT a.*, p.country, p.code AS project_code
+       FROM activities a LEFT JOIN projects p ON p.id = a.project_id
+       WHERE a.id = $1`, [id])).rows[0];
+    if (!prev) return res.status(404).json({ message: 'Attività non trovata' });
+
+    if (!(await canWriteCountry(req.user, prev.country))) {
+      return res.status(403).json({ message: `Non puoi eliminare attività della nazione ${prev.country}` });
+    }
+
     await pool.query('DELETE FROM activities WHERE id = $1', [id]);
+    await logAudit(req, {
+      action: 'delete', entityType: 'activity', entityId: prev.id,
+      entityLabel: `${prev.project_code || '—'} / ${prev.name}`, country: prev.country,
+      details: { start_date: prev.start_date, end_date: prev.end_date },
+    });
     res.json({ message: 'Attività eliminata' });
   } catch (error) {
     console.error('Error deleting activity:', error);
@@ -458,9 +731,499 @@ app.delete('/api/technicians/:id', authenticateToken, authorize(['admin']), asyn
 });
 
 // USERS
+// ---------------------------------------------------------------------------
+// Accesso dei tecnici (PWA)
+// Il codice e il token viaggiano in chiaro una sola volta e sul database
+// restano solo gli hash: chi legge le tabelle non puo' impersonare nessuno.
+// ---------------------------------------------------------------------------
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const INVITE_HOURS = 72;
+
+// Genera un invito monouso per un tecnico
+app.post('/api/technicians/:id/invite', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tech = (await pool.query('SELECT id, name FROM technicians WHERE id = $1', [id])).rows[0];
+    if (!tech) return res.status(404).json({ message: 'Tecnico non trovato' });
+
+    // Gli inviti precedenti non ancora usati decadono: uno solo valido per volta
+    await pool.query(
+      'UPDATE technician_invites SET used_at = CURRENT_TIMESTAMP WHERE technician_id = $1 AND used_at IS NULL',
+      [id]);
+
+    const code = crypto.randomBytes(24).toString('base64url');
+    const expires = new Date(Date.now() + INVITE_HOURS * 3600 * 1000);
+    await pool.query(
+      'INSERT INTO technician_invites (technician_id, code_hash, expires_at, created_by) VALUES ($1,$2,$3,$4)',
+      [id, sha256(code), expires, req.user.id]);
+
+    await logAudit(req, {
+      action: 'create', entityType: 'invite', entityId: Number(id),
+      entityLabel: tech.name, details: { expires_at: expires.toISOString() },
+    });
+
+    // Il codice in chiaro esiste solo in questa risposta
+    res.status(201).json({ code, expires_at: expires, technician: tech.name });
+  } catch (error) {
+    console.error('Error creating invite:', error);
+    res.status(500).json({ message: 'Errore durante la creazione dell\'invito' });
+  }
+});
+
+// Dispositivi attivi di un tecnico
+app.get('/api/technicians/:id/devices', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, device_name, activated_at, last_seen, revoked_at
+       FROM technician_devices WHERE technician_id = $1 ORDER BY activated_at DESC`,
+      [req.params.id]);
+    res.json(r.rows);
+  } catch (error) {
+    console.error('Error fetching devices:', error);
+    res.status(500).json({ message: 'Errore durante il recupero dei dispositivi' });
+  }
+});
+
+// Revoca di un dispositivo: il telefono smarrito perde subito l'accesso
+app.delete('/api/tech-devices/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  try {
+    const d = (await pool.query(
+      `SELECT d.*, t.name AS technician_name FROM technician_devices d
+       JOIN technicians t ON t.id = d.technician_id WHERE d.id = $1`, [req.params.id])).rows[0];
+    if (!d) return res.status(404).json({ message: 'Dispositivo non trovato' });
+    await pool.query('UPDATE technician_devices SET revoked_at = CURRENT_TIMESTAMP WHERE id = $1', [req.params.id]);
+    await logAudit(req, {
+      action: 'delete', entityType: 'device', entityId: d.id,
+      entityLabel: `${d.technician_name} — ${d.device_name || 'dispositivo'}`,
+    });
+    res.json({ message: 'Dispositivo revocato' });
+  } catch (error) {
+    console.error('Error revoking device:', error);
+    res.status(500).json({ message: 'Errore durante la revoca' });
+  }
+});
+
+// --- Endpoint pubblici usati dalla PWA ---
+
+// Attivazione: scambia il codice dell'invito con un token di dispositivo
+app.post('/api/tech/activate', async (req, res) => {
+  const { code, device_name } = req.body || {};
+  if (!code) return res.status(400).json({ message: 'Codice mancante' });
+
+  try {
+    const inv = (await pool.query(
+      `SELECT * FROM technician_invites
+       WHERE code_hash = $1 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+      [sha256(code)])).rows[0];
+    if (!inv) return res.status(401).json({ message: 'Codice non valido o scaduto' });
+
+    const token = crypto.randomBytes(32).toString('base64url');
+    const dev = (await pool.query(
+      'INSERT INTO technician_devices (technician_id, token_hash, device_name) VALUES ($1,$2,$3) RETURNING id',
+      [inv.technician_id, sha256(token), (device_name || '').slice(0, 120) || 'Dispositivo'])).rows[0];
+
+    await pool.query('UPDATE technician_invites SET used_at = CURRENT_TIMESTAMP WHERE id = $1', [inv.id]);
+
+    const tech = (await pool.query(
+      'SELECT id, name, home_country FROM technicians WHERE id = $1', [inv.technician_id])).rows[0];
+
+    res.json({ token, technician: tech, device_id: dev.id });
+  } catch (error) {
+    console.error('Error activating device:', error);
+    res.status(500).json({ message: 'Errore durante l\'attivazione' });
+  }
+});
+
+// Riconosce il dispositivo dal token
+const authenticateDevice = async (req, res, next) => {
+  const token = req.headers['x-device-token'];
+  if (!token) return res.status(401).json({ message: 'Dispositivo non riconosciuto' });
+  try {
+    const d = (await pool.query(
+      `SELECT d.*, t.name, t.home_country, t.color
+       FROM technician_devices d JOIN technicians t ON t.id = d.technician_id
+       WHERE d.token_hash = $1 AND d.revoked_at IS NULL`, [sha256(token)])).rows[0];
+    if (!d) return res.status(401).json({ message: 'Accesso revocato' });
+    // Traccia l'ultimo accesso senza bloccare la risposta
+    pool.query('UPDATE technician_devices SET last_seen = CURRENT_TIMESTAMP WHERE id = $1', [d.id])
+      .catch(() => {});
+    req.device = d;
+    next();
+  } catch (error) {
+    console.error('Device auth error:', error);
+    res.status(500).json({ message: 'Errore di autenticazione' });
+  }
+};
+
+// Agenda personale: solo lettura, solo le proprie attivita'
+app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
+  const { from, to } = req.query;
+  const params = [req.device.technician_id];
+  let range = '';
+  if (from && to) {
+    params.push(to, from);
+    range = `AND a.start_date <= $${params.length - 1} AND a.end_date >= $${params.length}`;
+  }
+  try {
+    const acts = await pool.query(
+      `SELECT a.id, a.name, a.start_date, a.end_date, a.start_half, a.end_half, a.progress,
+              p.code AS project_code, p.name AS project_name, p.color AS project_color, p.country
+       FROM activities a
+       JOIN activity_technicians at ON at.activity_id = a.id
+       LEFT JOIN projects p ON p.id = a.project_id
+       WHERE at.technician_id = $1 ${range}
+       ORDER BY a.start_date`, params);
+
+    const abs = await pool.query(
+      `SELECT id, start_date, end_date, start_half, end_half, type, note
+       FROM technician_absences WHERE technician_id = $1 ORDER BY start_date`,
+      [req.device.technician_id]);
+
+    // I colleghi assegnati alle stesse attivita': serve sapere con chi si lavora
+    const mates = await pool.query(
+      `SELECT DISTINCT at2.activity_id, t.name, t.color
+       FROM activity_technicians at1
+       JOIN activity_technicians at2 ON at2.activity_id = at1.activity_id
+       JOIN technicians t ON t.id = at2.technician_id
+       WHERE at1.technician_id = $1 AND at2.technician_id <> $1`,
+      [req.device.technician_id]);
+
+    const byAct = {};
+    mates.rows.forEach(m => {
+      (byAct[m.activity_id] = byAct[m.activity_id] || []).push({ name: m.name, color: m.color });
+    });
+
+    res.json({
+      technician: { id: req.device.technician_id, name: req.device.name,
+                    home_country: req.device.home_country, color: req.device.color },
+      activities: acts.rows.map(a => ({ ...a, mates: byAct[a.id] || [] })),
+      absences: abs.rows,
+    });
+  } catch (error) {
+    console.error('Error fetching agenda:', error);
+    res.status(500).json({ message: 'Errore durante il recupero dell\'agenda' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Assenze dei tecnici
+// I tecnici sono un pool globale, quindi le assenze non seguono il vincolo di
+// nazione: chiunque possa scrivere (admin o editor) puo' registrarle.
+// ---------------------------------------------------------------------------
+app.get('/api/absences', authenticateToken, async (req, res) => {
+  const { technician_id, from, to } = req.query;
+  const where = [];
+  const params = [];
+  if (technician_id) { params.push(technician_id); where.push(`a.technician_id = $${params.length}`); }
+  if (from && to) {
+    params.push(to, from);
+    where.push(`a.start_date <= $${params.length - 1} AND a.end_date >= $${params.length}`);
+  }
+  const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  try {
+    const r = await pool.query(
+      `SELECT a.*, t.name AS technician_name, t.color AS technician_color, t.home_country
+       FROM technician_absences a
+       JOIN technicians t ON t.id = a.technician_id
+       ${clause}
+       ORDER BY a.start_date DESC`, params);
+    res.json(r.rows);
+  } catch (error) {
+    console.error('Error fetching absences:', error);
+    res.status(500).json({ message: 'Errore durante il recupero delle assenze' });
+  }
+});
+
+app.post('/api/absences', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { technician_id, start_date, end_date, start_half, end_half, type, note } = req.body;
+  const sHalf = start_half === 'PM' ? 'PM' : 'AM';
+  const eHalf = end_half === 'AM' ? 'AM' : 'PM';
+
+  const dateError = validateActivityDates(start_date, end_date, sHalf, eHalf);
+  if (dateError) return res.status(400).json({ message: dateError });
+  if (!technician_id) return res.status(400).json({ message: 'Tecnico obbligatorio' });
+
+  try {
+    const r = await pool.query(
+      `INSERT INTO technician_absences (technician_id, start_date, end_date, start_half, end_half, type, note, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [technician_id, start_date, end_date, sHalf, eHalf, type || 'vacation', note || null, req.user.id]
+    );
+    const a = r.rows[0];
+    const tech = (await pool.query('SELECT name FROM technicians WHERE id = $1', [technician_id])).rows[0];
+    await logAudit(req, {
+      action: 'create', entityType: 'absence', entityId: a.id,
+      entityLabel: `${tech?.name || '—'} — ${a.type}`,
+      details: { start_date: a.start_date, end_date: a.end_date, type: a.type },
+    });
+    res.status(201).json(a);
+  } catch (error) {
+    console.error('Error creating absence:', error);
+    res.status(500).json({ message: 'Errore durante la creazione dell\'assenza' });
+  }
+});
+
+app.put('/api/absences/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { id } = req.params;
+  const { technician_id, start_date, end_date, start_half, end_half, type, note } = req.body;
+  const sHalf = start_half === 'PM' ? 'PM' : 'AM';
+  const eHalf = end_half === 'AM' ? 'AM' : 'PM';
+
+  const dateError = validateActivityDates(start_date, end_date, sHalf, eHalf);
+  if (dateError) return res.status(400).json({ message: dateError });
+
+  try {
+    const r = await pool.query(
+      `UPDATE technician_absences
+       SET technician_id = $1, start_date = $2, end_date = $3, start_half = $4, end_half = $5, type = $6, note = $7
+       WHERE id = $8 RETURNING *`,
+      [technician_id, start_date, end_date, sHalf, eHalf, type || 'vacation', note || null, id]
+    );
+    if (!r.rows.length) return res.status(404).json({ message: 'Assenza non trovata' });
+    const a = r.rows[0];
+    await logAudit(req, {
+      action: 'update', entityType: 'absence', entityId: a.id,
+      entityLabel: `#${a.id}`,
+      details: { start_date: a.start_date, end_date: a.end_date, type: a.type },
+    });
+    res.json(a);
+  } catch (error) {
+    console.error('Error updating absence:', error);
+    res.status(500).json({ message: 'Errore durante l\'aggiornamento dell\'assenza' });
+  }
+});
+
+app.delete('/api/absences/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const prev = (await pool.query(
+      `SELECT a.*, t.name AS technician_name FROM technician_absences a
+       JOIN technicians t ON t.id = a.technician_id WHERE a.id = $1`, [id])).rows[0];
+    if (!prev) return res.status(404).json({ message: 'Assenza non trovata' });
+    await pool.query('DELETE FROM technician_absences WHERE id = $1', [id]);
+    await logAudit(req, {
+      action: 'delete', entityType: 'absence', entityId: prev.id,
+      entityLabel: `${prev.technician_name} — ${prev.type}`,
+      details: { start_date: prev.start_date, end_date: prev.end_date },
+    });
+    res.json({ message: 'Assenza eliminata' });
+  } catch (error) {
+    console.error('Error deleting absence:', error);
+    res.status(500).json({ message: 'Errore durante l\'eliminazione dell\'assenza' });
+  }
+});
+
+// Duplica un progetto con tutte le sue attivita', traslate di N giorni.
+// Gli interventi si somigliano fra loro: rifare a mano dieci attivita' ogni
+// volta e' il tipo di lavoro che fa abbandonare uno strumento.
+app.post('/api/projects/:id/duplicate', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { id } = req.params;
+  const { code, name, shift_days, country } = req.body;
+  const shift = parseInt(shift_days) || 0;
+
+  const client = await pool.connect();
+  try {
+    const src = (await client.query('SELECT * FROM projects WHERE id = $1', [id])).rows[0];
+    if (!src) return res.status(404).json({ message: 'Progetto non trovato' });
+
+    const newCC = (country || src.country || 'IT').toUpperCase();
+    if (!(await canWriteCountry(req.user, src.country))) {
+      return res.status(403).json({ message: `Non puoi duplicare progetti della nazione ${src.country}` });
+    }
+    if (!(await canWriteCountry(req.user, newCC))) {
+      return res.status(403).json({ message: `Non puoi creare progetti per la nazione ${newCC}` });
+    }
+
+    await client.query('BEGIN');
+
+    const np = (await client.query(
+      'INSERT INTO projects (code, name, color, country) VALUES ($1,$2,$3,$4) RETURNING *',
+      [code || `${src.code}-COPY`, name || `${src.name} (copia)`, src.color, newCC]
+    )).rows[0];
+
+    const acts = (await client.query(
+      'SELECT * FROM activities WHERE project_id = $1 ORDER BY start_date', [id])).rows;
+
+    for (const a of acts) {
+      const na = (await client.query(
+        `INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half)
+         VALUES ($1,$2,$3::date + $4::int,$5::date + $4::int,0,$6,$7) RETURNING id`,
+        [a.name, np.id, a.start_date, shift, a.end_date, a.start_half, a.end_half]
+      )).rows[0];
+
+      // I tecnici si copiano: chi ha fatto l'intervento la volta scorsa e'
+      // il candidato piu' probabile anche stavolta, e si cambia in un clic.
+      const techs = (await client.query(
+        'SELECT technician_id FROM activity_technicians WHERE activity_id = $1', [a.id])).rows;
+      for (const tt of techs) {
+        await client.query(
+          'INSERT INTO activity_technicians (activity_id, technician_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [na.id, tt.technician_id]);
+      }
+    }
+
+    await client.query('COMMIT');
+    await logAudit(req, {
+      action: 'create', entityType: 'project', entityId: np.id,
+      entityLabel: `${np.code} - ${np.name}`, country: np.country,
+      details: { duplicated_from: src.code, activities: acts.length, shift_days: shift },
+    });
+    res.status(201).json({ project: np, activities: acts.length });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error duplicating project:', error);
+    res.status(500).json({ message: 'Errore durante la duplicazione' });
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Backup e ripristino
+// Formato JSON invece di pg_dump: non richiede il client PostgreSQL nel
+// container del backend, ed e' leggibile e verificabile prima di ripristinarlo.
+// ---------------------------------------------------------------------------
+// L'ordine e' quello di inserimento: le dipendenze prima di chi le usa.
+// user_countries non ha una colonna id (la chiave e' la coppia utente/nazione),
+// quindi l'ordinamento va dichiarato tabella per tabella.
+const BACKUP_TABLES = [
+  { name: 'users',                orderBy: 'id' },
+  { name: 'user_countries',       orderBy: 'user_id, country' },
+  { name: 'technicians',          orderBy: 'id' },
+  { name: 'projects',             orderBy: 'id' },
+  { name: 'activities',           orderBy: 'id' },
+  { name: 'activity_technicians', orderBy: 'id' },
+  { name: 'technician_absences',  orderBy: 'id' },
+];
+
+app.get('/api/admin/backup', authenticateToken, authorize(['admin']), async (req, res) => {
+  try {
+    const data = {};
+    for (const { name, orderBy } of BACKUP_TABLES) {
+      const r = await pool.query(`SELECT * FROM ${name} ORDER BY ${orderBy}`);
+      data[name] = r.rows;
+    }
+    const payload = {
+      format: 'progetto.io-backup',
+      version: 1,
+      created_at: new Date().toISOString(),
+      created_by: req.user.email,
+      counts: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, v.length])),
+      data,
+    };
+    await logAudit(req, {
+      action: 'backup', entityType: 'database', entityLabel: 'backup',
+      details: payload.counts,
+    });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    res.setHeader('Content-Disposition', `attachment; filename="progetto-backup-${stamp}.json"`);
+    res.setHeader('Content-Type', 'application/json');
+    res.send(JSON.stringify(payload, null, 2));
+  } catch (error) {
+    console.error('Error creating backup:', error);
+    res.status(500).json({ message: 'Errore durante la creazione del backup' });
+  }
+});
+
+app.post('/api/admin/restore', authenticateToken, authorize(['admin']), async (req, res) => {
+  const payload = req.body;
+  if (!payload || payload.format !== 'progetto.io-backup' || !payload.data) {
+    return res.status(400).json({ message: 'File di backup non valido' });
+  }
+
+  // Non si ripristina sopra i dati vivi senza rete di sicurezza: prima si salva
+  // lo stato attuale, cosi' un ripristino sbagliato resta rimediabile.
+  const safety = {};
+  try {
+    for (const { name, orderBy } of BACKUP_TABLES) {
+      safety[name] = (await pool.query(`SELECT * FROM ${name} ORDER BY ${orderBy}`)).rows;
+    }
+  } catch (e) {
+    return res.status(500).json({ message: 'Impossibile salvare lo stato attuale, ripristino annullato' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Ordine inverso per le dipendenze
+    for (const { name } of [...BACKUP_TABLES].reverse()) {
+      await client.query(`DELETE FROM ${name}`);
+    }
+
+    let inserted = 0;
+    for (const { name: t } of BACKUP_TABLES) {
+      const rows = payload.data[t] || [];
+      for (const row of rows) {
+        const cols = Object.keys(row);
+        if (!cols.length) continue;
+        const ph = cols.map((_, i) => `$${i + 1}`).join(',');
+        await client.query(
+          `INSERT INTO ${t} (${cols.map(x => `"${x}"`).join(',')}) VALUES (${ph})`,
+          cols.map(x => row[x])
+        );
+        inserted++;
+      }
+      // Riallinea la sequenza, altrimenti i nuovi inserimenti collidono
+      if (rows.length && 'id' in rows[0]) {
+        await client.query(
+          `SELECT setval(pg_get_serial_sequence('${t}', 'id'), COALESCE((SELECT MAX(id) FROM ${t}), 1), true)`
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    await logAudit(req, {
+      action: 'restore', entityType: 'database', entityLabel: 'restore',
+      details: { from: payload.created_at, rows: inserted },
+    });
+    res.json({ message: 'Ripristino completato', rows: inserted });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error restoring backup:', error);
+    res.status(500).json({ message: 'Ripristino fallito, nessuna modifica applicata: ' + error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Registro modifiche — solo admin, paginato
+app.get('/api/audit', authenticateToken, authorize(['admin']), async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = parseInt(req.query.offset) || 0;
+  const { entity_type, user_id, country } = req.query;
+
+  const where = [];
+  const params = [];
+  if (entity_type) { params.push(entity_type); where.push(`entity_type = $${params.length}`); }
+  if (user_id)     { params.push(user_id);     where.push(`user_id = $${params.length}`); }
+  if (country)     { params.push(country);     where.push(`country = $${params.length}`); }
+  const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+  try {
+    const total = await pool.query(`SELECT COUNT(*)::int AS n FROM audit_log ${clause}`, params);
+    params.push(limit, offset);
+    const rows = await pool.query(
+      `SELECT * FROM audit_log ${clause} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    res.json({ total: total.rows[0].n, rows: rows.rows });
+  } catch (error) {
+    console.error('Error fetching audit log:', error);
+    res.status(500).json({ message: 'Errore durante il recupero del registro' });
+  }
+});
+
 app.get('/api/users', authenticateToken, authorize(['admin']), async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, email, name, role, phone, active, created_at FROM users ORDER BY created_at DESC');
+    const result = await pool.query(`
+      SELECT u.id, u.email, u.name, u.role, u.phone, u.active, u.created_at,
+             COALESCE(ARRAY_AGG(uc.country) FILTER (WHERE uc.country IS NOT NULL), '{}') AS countries
+      FROM users u
+      LEFT JOIN user_countries uc ON uc.user_id = u.id
+      GROUP BY u.id
+      ORDER BY u.created_at DESC
+    `);
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching users:', error);
@@ -469,15 +1232,27 @@ app.get('/api/users', authenticateToken, authorize(['admin']), async (req, res) 
 });
 
 app.post('/api/users', authenticateToken, authorize(['admin']), async (req, res) => {
-  const { email, password, name, role, phone } = req.body;
-  
+  const { email, password, name, role, phone, countries } = req.body;
+
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (email, password, name, role, phone) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name, role, phone, active, created_at',
       [email, hashedPassword, name, role, phone]
     );
-    res.status(201).json(result.rows[0]);
+    const u = result.rows[0];
+    if (Array.isArray(countries) && countries.length) {
+      for (const cc of countries) {
+        await pool.query('INSERT INTO user_countries (user_id, country) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [u.id, String(cc).toUpperCase()]);
+      }
+    }
+    await logAudit(req, {
+      action: 'create', entityType: 'user', entityId: u.id,
+      entityLabel: `${u.name} (${u.email})`,
+      details: { role: u.role, countries: countries || [] },
+    });
+    res.status(201).json({ ...u, countries: countries || [] });
   } catch (error) {
     console.error('Error creating user:', error);
     res.status(500).json({ message: 'Errore durante la creazione dell\'utente' });
@@ -486,19 +1261,34 @@ app.post('/api/users', authenticateToken, authorize(['admin']), async (req, res)
 
 app.put('/api/users/:id', authenticateToken, authorize(['admin']), async (req, res) => {
   const { id } = req.params;
-  const { name, email, phone, role } = req.body;
-  
+  const { name, email, phone, role, countries } = req.body;
+
   try {
     const result = await pool.query(
       'UPDATE users SET name = $1, email = $2, phone = $3, role = $4 WHERE id = $5 RETURNING id, email, name, role, phone, active, created_at',
       [name, email, phone, role, id]
     );
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({ message: 'Utente non trovato' });
     }
-    
-    res.json(result.rows[0]);
+
+    // Le aree si riscrivono per intero: piu' semplice e senza stati intermedi
+    if (Array.isArray(countries)) {
+      await pool.query('DELETE FROM user_countries WHERE user_id = $1', [id]);
+      for (const cc of countries) {
+        await pool.query('INSERT INTO user_countries (user_id, country) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [id, String(cc).toUpperCase()]);
+      }
+    }
+
+    const u = result.rows[0];
+    await logAudit(req, {
+      action: 'update', entityType: 'user', entityId: u.id,
+      entityLabel: `${u.name} (${u.email})`,
+      details: { role: u.role, countries: countries || null },
+    });
+    res.json({ ...u, countries: countries || [] });
   } catch (error) {
     console.error('Error updating user:', error);
     res.status(500).json({ message: 'Errore durante l\'aggiornamento dell\'utente' });

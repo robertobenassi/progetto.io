@@ -19,11 +19,12 @@ services:
       retries: 5
 
   # === BACKEND ===
+  # Non espone porte: ci si arriva solo passando dal frontend.
   backend:
     build: ./backend
     container_name: progetto_backend
     environment:
-      NODE_ENV: ${NODE_ENV}
+      NODE_ENV: ${NODE_ENV:-production}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: ${DB_USER}
@@ -39,46 +40,32 @@ services:
       - internal
 
   # === FRONTEND ===
+  # Unico punto d'ingresso: serve l'applicazione, la PWA dei tecnici e
+  # inoltra /api al backend. Basta puntarci il proprio reverse proxy.
   frontend:
     build: ./frontend
     container_name: progetto_frontend
-    depends_on:
-      - backend
-    restart: unless-stopped
-    networks:
-      - internal
-
-  # === CADDY - profilo standalone (porta 80/443) ===
-  caddy:
-    image: caddy@sha256:fce4f15aad23222c0ac78a1220adf63bae7b94355d5ea28eee53910624acedfa
-    container_name: progetto_caddy
-    profiles:
-      - standalone
+    # In ascolto solo su localhost: il traffico deve passare dal reverse proxy,
+    # altrimenti l'applicazione resterebbe raggiungibile in chiaro sull'IP
+    # pubblico, scavalcando HTTPS. Per esporla su tutte le interfacce (rete
+    # locale fidata, nessun proxy) impostare APP_BIND=0.0.0.0 nel file .env.
     ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
-      - ./nginx/technician:/srv/technician
-      - caddy_data:/data
-      - caddy_config:/config
-    environment:
-      CADDY_DOMAIN: ${CADDY_DOMAIN}
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:80"
     depends_on:
-      - frontend
       - backend
     restart: unless-stopped
     networks:
       - internal
-      - external
+      - web
 
 volumes:
   postgres_data:
-  caddy_data:
-  caddy_config:
 
 networks:
+  # internal: isolata, senza accesso a Internet. Database e backend vivono qui.
   internal:
     internal: true
-  external:
-    name: progetto_external
+  # web: serve al frontend per pubblicare la porta. Una rete "internal" non
+  # permette il port mapping, quindi il frontend deve stare su entrambe.
+  web:
+    driver: bridge

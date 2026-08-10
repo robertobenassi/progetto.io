@@ -5,3 +5,11 @@ frontend/build/
 *.sql.backup
 caddy/data/
 caddy/config/
+
+# Configurazione specifica dell'installazione
+docker-compose.override.yml
+
+# Backup e dump
+*.sql
+*.tar.gz
+backup*/
