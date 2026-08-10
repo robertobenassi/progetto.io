@@ -4,6 +4,7 @@ const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,7 +19,20 @@ const pool = new Pool({
 });
 
 // Middleware
-app.use(cors());
+// CORS limitato alle origini dichiarate. Con cors() senza opzioni qualsiasi
+// sito poteva chiamare l'API dal browser di un utente autenticato.
+// Vuoto = nessuna origine esterna ammessa (frontend e API stanno sullo stesso host).
+const originiAmmesse = (process.env.CORS_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);            // stesso host o strumenti da riga di comando
+    if (!originiAmmesse.length) return cb(null, false);
+    return cb(null, originiAmmesse.includes(origin));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
@@ -258,6 +272,20 @@ const initDB = async () => {
       );
     `);
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_resets_token ON password_resets(token_hash);
+    `);
+
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_devices_tech  ON technician_devices(technician_id);
       CREATE INDEX IF NOT EXISTS idx_devices_token ON technician_devices(token_hash);
       CREATE INDEX IF NOT EXISTS idx_invites_tech  ON technician_invites(technician_id);
@@ -293,7 +321,10 @@ const initDB = async () => {
     // Create default admin user if not exists
     const userCheck = await pool.query('SELECT * FROM users WHERE email = $1', ['admin@progetto.io']);
     if (userCheck.rows.length === 0) {
-      const hashedPassword = await bcrypt.hash('admin123', 10);
+      // La password iniziale si puo' impostare da .env. Senza, resta il valore
+      // storico: il primo accesso avvisa comunque di cambiarla.
+      const passwordIniziale = process.env.ADMIN_PASSWORD || 'admin123';
+      const hashedPassword = await bcrypt.hash(passwordIniziale, 10);
       await pool.query(
         'INSERT INTO users (email, password, name, role, phone) VALUES ($1, $2, $3, $4, $5)',
         ['admin@progetto.io', hashedPassword, 'Admin User', 'admin', '+39 123 456 7890']
@@ -338,7 +369,14 @@ app.get('/api/health', (req, res) => {
 // Login
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
-  
+
+  // Senza un limite, la password predefinita si indovina in pochi minuti.
+  // Il conteggio e' per indirizzo IP e si azzera dopo un accesso riuscito.
+  const chiave = 'login:' + (req.ip || 'x');
+  if (tooManyAttempts(chiave, 5, 15 * 60 * 1000)) {
+    return res.status(429).json({ message: 'Troppi tentativi. Riprova fra qualche minuto.' });
+  }
+
   try {
     const result = await pool.query(
       'SELECT id, email, password, role, name, phone, technician_id FROM users WHERE email = $1 AND active = true',
@@ -356,6 +394,8 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ message: 'Email o password non validi' });
     }
     
+    clearAttempts(chiave);
+
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role },
       JWT_SECRET,
@@ -683,7 +723,9 @@ app.post('/api/technicians', authenticateToken, authorize(['admin', 'editor']), 
     const technician = techResult.rows[0];
     
     // Crea automaticamente utente viewer associato
-    const defaultPassword = 'password123'; // Password di default
+    // Password provvisoria diversa per ogni utente creato: una uguale per tutti
+    // e' nota a chiunque abbia visto il codice.
+    const defaultPassword = crypto.randomBytes(9).toString('base64url');
     const hashedPassword = await bcrypt.hash(defaultPassword, 10);
     
     await client.query(
@@ -732,6 +774,131 @@ app.delete('/api/technicians/:id', authenticateToken, authorize(['admin']), asyn
 
 // USERS
 // ---------------------------------------------------------------------------
+// Posta elettronica (facoltativa)
+// Senza SMTP_HOST la funzione resta spenta e l'interfaccia non mostra il
+// recupero password: meglio un'opzione assente che una che fallisce.
+// ---------------------------------------------------------------------------
+const mailEnabled = Boolean(process.env.SMTP_HOST);
+
+const mailer = mailEnabled ? nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT) || 587,
+  secure: String(process.env.SMTP_SECURE) === 'true',   // true solo per la porta 465
+  auth: process.env.SMTP_USER
+    ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    : undefined,
+}) : null;
+
+const sendMail = async ({ to, subject, text }) => {
+  if (!mailer) throw new Error('SMTP non configurato');
+  await mailer.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to, subject, text,
+  });
+};
+
+const APP_VERSION = require('./package.json').version;
+
+app.get('/api/config', (req, res) => {
+  // L'interfaccia usa questo per sapere quali funzioni mostrare e per
+  // confrontare la versione installata con l'ultima pubblicata.
+  res.json({ mailEnabled, version: APP_VERSION });
+});
+
+// ---------------------------------------------------------------------------
+// Limite ai tentativi
+// In memoria: al riavvio i contatori si azzerano, ed e' accettabile. Bloccare
+// un attacco a forza bruta non richiede di ricordarlo per sempre.
+// ---------------------------------------------------------------------------
+const attempts = new Map();
+
+const tooManyAttempts = (key, max, windowMs) => {
+  const now = Date.now();
+  const e = attempts.get(key);
+  if (!e || now - e.first > windowMs) {
+    attempts.set(key, { n: 1, first: now });
+    return false;
+  }
+  e.n += 1;
+  return e.n > max;
+};
+
+const clearAttempts = (key) => attempts.delete(key);
+
+// Pulizia periodica: senza, la mappa crescerebbe indefinitamente
+setInterval(() => {
+  const now = Date.now();
+  attempts.forEach((v, k) => { if (now - v.first > 3600000) attempts.delete(k); });
+}, 600000).unref();
+
+// ---------------------------------------------------------------------------
+// Recupero password
+// ---------------------------------------------------------------------------
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body || {};
+  if (!mailEnabled) return res.status(503).json({ message: 'Recupero password non disponibile' });
+
+  if (tooManyAttempts('forgot:' + (req.ip || 'x'), 5, 3600000)) {
+    return res.status(429).json({ message: 'Troppe richieste, riprova più tardi' });
+  }
+
+  // La risposta e' sempre la stessa, anche se l'indirizzo non esiste:
+  // altrimenti questa pagina direbbe a chiunque chi ha un account.
+  const risposta = { message: 'Se l\'indirizzo è registrato, riceverai un\'email con le istruzioni' };
+
+  try {
+    const u = (await pool.query('SELECT id, name, email FROM users WHERE email = $1 AND active = true', [email])).rows[0];
+    if (!u) return res.json(risposta);
+
+    const token = crypto.randomBytes(32).toString('base64url');
+    const expires = new Date(Date.now() + 3600 * 1000);   // un'ora
+    await pool.query('UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND used_at IS NULL', [u.id]);
+    await pool.query(
+      'INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1,$2,$3)',
+      [u.id, sha256(token), expires]);
+
+    const base = process.env.APP_URL || '';
+    await sendMail({
+      to: u.email,
+      subject: 'Progetto.io — reimposta la password',
+      text: `Ciao ${u.name || ''},\n\n`
+          + `hai chiesto di reimpostare la password di Progetto.io.\n`
+          + `Apri questo indirizzo entro un'ora:\n\n${base}/?reset=${token}\n\n`
+          + `Se non sei stato tu, ignora questo messaggio: la password resta invariata.\n`,
+    });
+    res.json(risposta);
+  } catch (error) {
+    console.error('Errore invio recupero password:', error.message);
+    // Anche in caso di errore la risposta non cambia
+    res.json(risposta);
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ message: 'Dati mancanti' });
+  if (String(password).length < 8) {
+    return res.status(400).json({ message: 'La password deve avere almeno 8 caratteri' });
+  }
+  try {
+    const r = (await pool.query(
+      `SELECT * FROM password_resets
+       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+      [sha256(token)])).rows[0];
+    if (!r) return res.status(400).json({ message: 'Link non valido o scaduto' });
+
+    await pool.query('UPDATE users SET password = $1 WHERE id = $2',
+      [await bcrypt.hash(password, 10), r.user_id]);
+    await pool.query('UPDATE password_resets SET used_at = CURRENT_TIMESTAMP WHERE id = $1', [r.id]);
+
+    res.json({ message: 'Password aggiornata' });
+  } catch (error) {
+    console.error('Errore reset password:', error);
+    res.status(500).json({ message: 'Errore durante il reimposta password' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Accesso dei tecnici (PWA)
 // Il codice e il token viaggiano in chiaro una sola volta e sul database
 // restano solo gli hash: chi legge le tabelle non puo' impersonare nessuno.
@@ -767,6 +934,39 @@ app.post('/api/technicians/:id/invite', authenticateToken, authorize(['admin', '
   } catch (error) {
     console.error('Error creating invite:', error);
     res.status(500).json({ message: 'Errore durante la creazione dell\'invito' });
+  }
+});
+
+// Invio dell'invito per email. Il link copiabile resta comunque disponibile:
+// funziona sempre, anche senza SMTP.
+app.post('/api/technicians/:id/invite-email', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  if (!mailEnabled) return res.status(503).json({ message: 'Invio email non disponibile' });
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ message: 'Codice mancante' });
+
+  try {
+    const tech = (await pool.query('SELECT name, email FROM technicians WHERE id = $1', [req.params.id])).rows[0];
+    if (!tech) return res.status(404).json({ message: 'Tecnico non trovato' });
+    if (!tech.email) return res.status(400).json({ message: 'Il tecnico non ha un indirizzo email' });
+
+    const base = process.env.APP_URL || '';
+    await sendMail({
+      to: tech.email,
+      subject: 'Progetto.io — attiva l\'app sul telefono',
+      text: `Ciao ${tech.name},\n\n`
+          + `apri questo indirizzo dal telefono per attivare l'app con le tue attività:\n\n`
+          + `${base}/technician/#${code}\n\n`
+          + `Il link vale 72 ore e può essere usato una sola volta.\n`
+          + `Dopo l'attivazione potrai aggiungere l'app alla schermata iniziale.\n`,
+    });
+    await logAudit(req, {
+      action: 'create', entityType: 'invite', entityId: Number(req.params.id),
+      entityLabel: `${tech.name} (email)`,
+    });
+    res.json({ message: 'Invito inviato a ' + tech.email });
+  } catch (error) {
+    console.error('Errore invio invito:', error.message);
+    res.status(500).json({ message: 'Invio non riuscito: ' + error.message });
   }
 });
 
@@ -1233,6 +1433,10 @@ app.get('/api/users', authenticateToken, authorize(['admin']), async (req, res) 
 
 app.post('/api/users', authenticateToken, authorize(['admin']), async (req, res) => {
   const { email, password, name, role, phone, countries } = req.body;
+
+  if (!password || String(password).length < 8) {
+    return res.status(400).json({ message: 'La password deve avere almeno 8 caratteri' });
+  }
 
   try {
     const hashedPassword = await bcrypt.hash(password, 10);

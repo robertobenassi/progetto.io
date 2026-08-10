@@ -75,6 +75,14 @@ const App = () => {
   const [deviceTech, setDeviceTech] = useState(null);
   const [devices, setDevices] = useState([]);
   const [newInvite, setNewInvite] = useState(null);
+  const [mailEnabled, setMailEnabled] = useState(false);
+  const [appVersion, setAppVersion] = useState('');
+  const [latestRelease, setLatestRelease] = useState(null);
+  const [showForgot, setShowForgot] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [forgotMsg, setForgotMsg] = useState('');
+  const [resetToken, setResetToken] = useState(null);
+  const [resetPwd, setResetPwd] = useState('');
   const [auditRows, setAuditRows] = useState([]);
   const [auditTotal, setAuditTotal] = useState(0);
   const [auditPage, setAuditPage] = useState(0);
@@ -102,6 +110,30 @@ const App = () => {
   const [inverted, setInverted] = useState(() => {
     try { return localStorage.getItem('inverted') === '1'; } catch { return false; }
   });
+  // L'interfaccia mostra il recupero password solo se il server ha un SMTP:
+  // meglio non offrire una funzione che poi fallisce.
+  useEffect(() => {
+    axios.get(`${API_URL}/config`)
+      .then(r => {
+        setMailEnabled(Boolean(r.data?.mailEnabled));
+        setAppVersion(r.data?.version || '');
+      })
+      .catch(() => setMailEnabled(false));
+    const t = new URLSearchParams(window.location.search).get('reset');
+    if (t) setResetToken(t);
+  }, []);
+
+  // Controllo automatico degli aggiornamenti, al massimo una volta al giorno
+  useEffect(() => {
+    if (user?.role !== 'admin' || !appVersion) return;
+    let ultimo = 0;
+    try { ultimo = Number(localStorage.getItem('lastUpdateCheck') || 0); } catch {}
+    if (Date.now() - ultimo < 86400000) return;
+    try { localStorage.setItem('lastUpdateCheck', String(Date.now())); } catch {}
+    checkUpdates(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, appVersion]);
+
   // Il registro si popola entrando nella pagina: un pulsante "carica" accanto
   // a "ripristina backup" era ambiguo, sembrava riferirsi a un file.
   useEffect(() => {
@@ -319,6 +351,65 @@ const App = () => {
       alert(`${t('duplicated')}: ${res.data.project.code} (${res.data.activities})`);
     } catch (error) {
       alert(error.response?.data?.message || 'Errore durante la duplicazione');
+    }
+  };
+
+  // Il confronto lo fa il browser contattando GitHub: il backend sta su una
+  // rete isolata e non vede Internet. Nessun dato lascia il server.
+  const versionCompare = (a, b) => {
+    const pa = String(a).replace(/^v/, '').split('.').map(Number);
+    const pb = String(b).replace(/^v/, '').split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+      if ((pa[i] || 0) < (pb[i] || 0)) return -1;
+    }
+    return 0;
+  };
+
+  const checkUpdates = async (silent) => {
+    try {
+      const r = await fetch('https://api.github.com/repos/robertobenassi/progetto.io/releases/latest');
+      if (!r.ok) throw new Error('non disponibile');
+      const d = await r.json();
+      setLatestRelease({
+        tag: d.tag_name, name: d.name, body: d.body,
+        url: d.html_url, published: d.published_at,
+      });
+    } catch {
+      if (!silent) alert(t('updateCheckFailed'));
+      setLatestRelease(null);
+    }
+  };
+
+  const handleForgot = async (e) => {
+    e.preventDefault();
+    setForgotMsg('...');
+    try {
+      const r = await axios.post(`${API_URL}/auth/forgot-password`, { email: forgotEmail });
+      setForgotMsg(r.data.message);
+    } catch (err) {
+      setForgotMsg(err.response?.data?.message || 'Errore');
+    }
+  };
+
+  const handleResetPassword = async (e) => {
+    e.preventDefault();
+    try {
+      await axios.post(`${API_URL}/auth/reset-password`, { token: resetToken, password: resetPwd });
+      alert(t('passwordUpdated'));
+      window.location.href = window.location.pathname;
+    } catch (err) {
+      alert(err.response?.data?.message || 'Errore');
+    }
+  };
+
+  const sendInviteEmail = async () => {
+    try {
+      const r = await axios.post(`${API_URL}/technicians/${deviceTech.id}/invite-email`,
+        { code: newInvite.code });
+      alert(r.data.message);
+    } catch (err) {
+      alert(err.response?.data?.message || 'Invio non riuscito');
     }
   };
 
@@ -1302,6 +1393,52 @@ const handleSaveActivity = async (activityData) => {
     );
   };
 
+  if (resetToken) {
+    return (
+      <div style={{
+        minHeight: '100vh', display: 'flex', alignItems: 'center',
+        justifyContent: 'center', backgroundColor: 'var(--barBg)',
+      }}>
+        <div style={{
+          backgroundColor: 'var(--surface)', color: 'var(--fg)', padding: '2rem',
+          borderRadius: 10, width: '100%', maxWidth: 400,
+        }}>
+          <h2 style={{ textAlign: 'center', marginTop: 0 }}>{t('newPassword')}</h2>
+          <form onSubmit={handleResetPassword}>
+            <input
+              type="password"
+              value={resetPwd}
+              onChange={(e) => setResetPwd(e.target.value)}
+              placeholder={t('newPassword')}
+              minLength={8}
+              required
+              style={{
+                width: '100%', padding: 12, marginBottom: 8, borderRadius: 5,
+                border: '1px solid var(--border)', boxSizing: 'border-box',
+                backgroundColor: 'var(--surface)', color: 'var(--fg)',
+              }}
+            />
+            <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 14 }}>
+              {t('passwordMin')}
+            </div>
+            <button type="submit" style={{
+              width: '100%', padding: 12, borderRadius: 5, border: 'none',
+              backgroundColor: 'var(--accent)', color: 'var(--accentFg)',
+              fontSize: 16, fontWeight: 600, cursor: 'pointer',
+            }}>{t('save')}</button>
+          </form>
+          <button
+            onClick={() => { setResetToken(null); window.history.replaceState(null,'',window.location.pathname); }}
+            style={{
+              width: '100%', marginTop: 10, padding: 10, borderRadius: 5,
+              border: '1px solid var(--border)', background: 'transparent',
+              color: 'var(--fg)', cursor: 'pointer',
+            }}>{t('cancel')}</button>
+        </div>
+      </div>
+    );
+  }
+
   if (showLogin) {
     return (
       <div style={{
@@ -1320,12 +1457,12 @@ const handleSaveActivity = async (activityData) => {
           maxWidth: '400px'
         }}>
           <h2 style={{ textAlign: 'center', marginBottom: '1.5rem', color: 'var(--fg)' }}>
-            Progetto.io - Login
+            Progetto.io
           </h2>
           <form onSubmit={handleLogin}>
             <input
               type="email"
-              placeholder="Email"
+              placeholder={t('email')}
               value={loginData.email}
               onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
               required
@@ -1341,7 +1478,7 @@ const handleSaveActivity = async (activityData) => {
             />
             <input
               type="password"
-              placeholder="Password"
+              placeholder={t('password')}
               value={loginData.password}
               onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
               required
@@ -1383,9 +1520,58 @@ const handleSaveActivity = async (activityData) => {
                 opacity: loading ? 0.7 : 1
               }}
             >
-              {loading ? 'Accesso in corso...' : 'Accedi'}
+              {loading ? t('signingIn') : t('signIn')}
             </button>
           </form>
+
+          {/* Compare solo se il server ha un SMTP configurato */}
+          {mailEnabled && !showForgot && (
+            <button
+              onClick={() => { setShowForgot(true); setForgotMsg(''); }}
+              style={{
+                width: '100%', marginTop: 12, padding: 8, background: 'transparent',
+                border: 'none', color: 'var(--muted)', cursor: 'pointer',
+                fontSize: 13, textDecoration: 'underline',
+              }}>
+              {t('forgotPassword')}
+            </button>
+          )}
+
+          {mailEnabled && showForgot && (
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 8 }}>
+                {t('forgotHint')}
+              </div>
+              <form onSubmit={handleForgot}>
+                <input
+                  type="email"
+                  value={forgotEmail}
+                  onChange={(e) => setForgotEmail(e.target.value)}
+                  placeholder={t('email')}
+                  required
+                  style={{
+                    width: '100%', padding: 10, marginBottom: 8, borderRadius: 5,
+                    border: '1px solid var(--border)', boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }}
+                />
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button type="submit" style={{
+                    flex: 1, padding: 10, borderRadius: 5, border: 'none',
+                    backgroundColor: 'var(--accent)', color: 'var(--accentFg)',
+                    cursor: 'pointer', fontSize: 14,
+                  }}>{t('send')}</button>
+                  <button type="button" onClick={() => setShowForgot(false)} style={{
+                    padding: '10px 14px', borderRadius: 5, border: '1px solid var(--border)',
+                    background: 'transparent', color: 'var(--fg)', cursor: 'pointer', fontSize: 14,
+                  }}>{t('cancel')}</button>
+                </div>
+              </form>
+              {forgotMsg && (
+                <div style={{ marginTop: 10, fontSize: 13, color: 'var(--fg)' }}>{forgotMsg}</div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1494,7 +1680,7 @@ const handleSaveActivity = async (activityData) => {
             data-view="activities"
             {...navHover}
           >
-            ✅ Attività
+            ✅ {t('activities')}
           </button>
 
           <button
@@ -1716,7 +1902,7 @@ const handleSaveActivity = async (activityData) => {
             border: '1px solid var(--border)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ margin: 0 }}>Gestione Progetti</h2>
+              <h2 style={{ margin: 0 }}>{t('manageProjects')}</h2>
               {(user?.role === 'admin' || user?.role === 'editor') && (
                 <button
                   onClick={() => {
@@ -1736,7 +1922,7 @@ const handleSaveActivity = async (activityData) => {
                     gap: '0.5rem'
                   }}
                 >
-                  <Plus size={18} /> Nuovo Progetto
+                  <Plus size={18} /> {t('newProject')}
                 </button>
               )}
             </div>
@@ -1744,11 +1930,11 @@ const handleSaveActivity = async (activityData) => {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ backgroundColor: 'var(--surface2)' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Codice</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Colore</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('code')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('name')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('color')}</th>
                   {(user?.role === 'admin' || user?.role === 'editor') && (
-                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>Azioni</th>
+                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>{t('actions')}</th>
                   )}
                 </tr>
               </thead>
@@ -1830,7 +2016,7 @@ const handleSaveActivity = async (activityData) => {
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
               <h2 style={{ margin: 0 }}>
-                Gestione Attività
+                {t('manageActivities')}
                 <span style={{ fontSize: '0.8rem', fontWeight: 400, color: 'var(--muted)', marginLeft: 10 }}>
                   {activities.length} {t('activityCount')}
                 </span>
@@ -1855,7 +2041,7 @@ const handleSaveActivity = async (activityData) => {
                     gap: '0.5rem'
                   }}
                 >
-                  <Plus size={18} /> Nuova Attività
+                  <Plus size={18} /> {t('newActivity')}
                 </button>
               )}
             </div>
@@ -2098,7 +2284,7 @@ const handleSaveActivity = async (activityData) => {
             border: '1px solid var(--border)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ margin: 0 }}>Gestione Tecnici</h2>
+              <h2 style={{ margin: 0 }}>{t('manageTechnicians')}</h2>
               {(user?.role === 'admin' || user?.role === 'editor') && (
                 <button
                   onClick={() => {
@@ -2118,7 +2304,7 @@ const handleSaveActivity = async (activityData) => {
                     gap: '0.5rem'
                   }}
                 >
-                  <Plus size={18} /> Nuovo Tecnico
+                  <Plus size={18} /> {t('newTechnician')}
                 </button>
               )}
             </div>
@@ -2126,13 +2312,13 @@ const handleSaveActivity = async (activityData) => {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ backgroundColor: 'var(--surface2)' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Email</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Telefono</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Specializzazione</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Colore</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('name')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('email')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('phone')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('specialization')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('color')}</th>
                   {(user?.role === 'admin' || user?.role === 'editor') && (
-                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>Azioni</th>
+                    <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>{t('actions')}</th>
                   )}
                 </tr>
               </thead>
@@ -2254,12 +2440,12 @@ const handleSaveActivity = async (activityData) => {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ backgroundColor: 'var(--surface2)' }}>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Nome</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Email</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Telefono</th>
-                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>Ruolo</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('name')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('email')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('phone')}</th>
+                  <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('role')}</th>
                   <th style={{ padding: '12px', textAlign: 'left', borderBottom: '2px solid var(--border)' }}>{t('assignedAreas')}</th>
-                  <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>Azioni</th>
+                  <th style={{ padding: '12px', textAlign: 'center', borderBottom: '2px solid var(--border)' }}>{t('actions')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -2553,10 +2739,10 @@ const handleSaveActivity = async (activityData) => {
             width: '90%',
             maxWidth: '500px'
           }}>
-            <h3 style={{ marginTop: 0 }}>{editingProject?.id ? 'Modifica Progetto' : 'Nuovo Progetto'}</h3>
+            <h3 style={{ marginTop: 0 }}>{editingProject?.id ? t('editProject') : t('newProject')}</h3>
             <form onSubmit={handleSaveProject}>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Codice</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('code')}</label>
                 <input
                   type="text"
                   value={editingProject?.code || ''}
@@ -2574,7 +2760,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Nome</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('name')}</label>
                 <input
                   type="text"
                   value={editingProject?.name || ''}
@@ -2592,7 +2778,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Nazione</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('country')}</label>
                 <select
                   value={editingProject?.country || 'IT'}
                   onChange={(e) => setEditingProject({ ...editingProject, country: e.target.value })}
@@ -2615,7 +2801,7 @@ const handleSaveActivity = async (activityData) => {
                 </select>
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Colore</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('color')}</label>
                 <input
                   type="color"
                   value={editingProject?.color || '#555555'}
@@ -2691,10 +2877,10 @@ const handleSaveActivity = async (activityData) => {
             width: '90%',
             maxWidth: '500px'
           }}>
-            <h3 style={{ marginTop: 0 }}>{editingTechnician?.id ? 'Modifica Tecnico' : 'Nuovo Tecnico'}</h3>
+            <h3 style={{ marginTop: 0 }}>{editingTechnician?.id ? t('editTechnician') : t('newTechnician')}</h3>
             <form onSubmit={handleSaveTechnician}>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Nome</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('name')}</label>
                 <input
                   type="text"
                   value={editingTechnician?.name || ''}
@@ -2712,7 +2898,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Email</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('email')}</label>
                 <input
                   type="email"
                   value={editingTechnician?.email || ''}
@@ -2730,7 +2916,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Telefono</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('phone')}</label>
                 <input
                   type="tel"
                   value={editingTechnician?.phone || ''}
@@ -2748,7 +2934,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Specializzazione</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('specialization')}</label>
                 <input
                   type="text"
                   value={editingTechnician?.specialization || ''}
@@ -2766,7 +2952,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Colore</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('color')}</label>
                 <input
                   type="color"
                   value={editingTechnician?.color || '#555555'}
@@ -2842,7 +3028,7 @@ const handleSaveActivity = async (activityData) => {
             width: '90%',
             maxWidth: '600px'
           }}>
-            <h3 style={{ marginTop: 0 }}>{editingActivity?.id ? 'Modifica Attività' : 'Nuova Attività'}</h3>
+            <h3 style={{ marginTop: 0 }}>{editingActivity?.id ? t('editActivity') : t('newActivity')}</h3>
             <form onSubmit={(e) => {
               e.preventDefault();
               if (dateError) return;
@@ -2859,7 +3045,7 @@ const handleSaveActivity = async (activityData) => {
               });
             }}>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Nome Attività</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('activityName')}</label>
                 <input
                   name="name"
                   type="text"
@@ -2877,7 +3063,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Progetto</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('project')}</label>
                 <select
                   name="project_id"
                   defaultValue={editingActivity?.project_id || ''}
@@ -2892,7 +3078,7 @@ const handleSaveActivity = async (activityData) => {
                     color: 'var(--fg)'
                   }}
                 >
-                  <option value="" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>Seleziona un progetto</option>
+                  <option value="" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('selectProject')}</option>
                   {projects.map(p => (
                     <option key={p.id} value={p.id} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{p.code} - {p.name}</option>
                   ))}
@@ -2903,7 +3089,7 @@ const handleSaveActivity = async (activityData) => {
 
 
 		<div style={{ marginBottom: '1rem' }}>
-  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Tecnici</label>
+  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('technicians')}</label>
   <div style={{ border: '1px solid var(--border)', borderRadius: '5px', padding: '10px', maxHeight: '150px', overflowY: 'auto' }}>
     {technicians.map(tech => (
       <div key={tech.id} style={{ marginBottom: '5px' }}>
@@ -2930,7 +3116,7 @@ const handleSaveActivity = async (activityData) => {
 </div>
               <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem' }}>
                 <div style={{ flex: 1 }}>
-                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Data Inizio</label>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('startDate')}</label>
                   <input
                     name="start_date"
                     type="date"
@@ -2963,7 +3149,7 @@ const handleSaveActivity = async (activityData) => {
                   </select>
                 </div>
                 <div style={{ flex: 1 }}>
-                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Data Fine</label>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('endDate')}</label>
                   <input
                     name="end_date"
                     type="date"
@@ -3011,7 +3197,7 @@ const handleSaveActivity = async (activityData) => {
                 ) : null}
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Progresso (%)</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('progress')} (%)</label>
                 <input
                   name="progress"
                   type="number"
@@ -3082,6 +3268,87 @@ const handleSaveActivity = async (activityData) => {
           <p style={{ margin: '0 0 1rem 0', fontSize: 13, color: 'var(--muted)' }}>
             {t('maintenanceHint')}
           </p>
+
+          {/* Aggiornamenti */}
+          <div style={{
+            backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 8, padding: '1rem', marginBottom: '1rem',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>⬆ {t('updates')}</h3>
+              <span style={{ fontSize: 13, color: 'var(--muted)' }}>
+                {t('installedVersion')}: <strong style={{ color: 'var(--fg)' }}>{appVersion || '—'}</strong>
+              </span>
+              <button onClick={() => checkUpdates(false)}
+                style={{
+                  padding: '4px 12px', fontSize: 12, cursor: 'pointer',
+                  border: '1px solid var(--border)', borderRadius: 5,
+                  background: 'transparent', color: 'var(--fg)',
+                }}>
+                ↻ {t('checkUpdates')}
+              </button>
+            </div>
+
+            {latestRelease && versionCompare(appVersion, latestRelease.tag) < 0 && (
+              <div style={{
+                marginTop: 12, padding: '0.9rem', borderRadius: 6,
+                border: '2px solid var(--accent)', backgroundColor: 'var(--surface2)',
+              }}>
+                <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>
+                  {t('updateAvailable')}: {latestRelease.tag}
+                </div>
+                {latestRelease.published && (
+                  <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 8 }}>
+                    {new Date(latestRelease.published).toLocaleDateString(locale)}
+                    {latestRelease.url && (
+                      <> · <a href={latestRelease.url} target="_blank" rel="noreferrer"
+                             style={{ color: 'var(--fg)' }}>{t('releaseNotes')}</a></>
+                    )}
+                  </div>
+                )}
+                {latestRelease.body && (
+                  <pre style={{
+                    fontSize: 12, color: 'var(--muted)', whiteSpace: 'pre-wrap',
+                    maxHeight: 130, overflow: 'auto', margin: '0 0 10px 0',
+                    fontFamily: 'inherit',
+                  }}>{latestRelease.body.slice(0, 700)}</pre>
+                )}
+
+                <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>
+                  {t('updateHowTo')}
+                </div>
+                <input
+                  readOnly
+                  value="cd ~/progetto.io && git pull && docker compose up -d --build"
+                  onFocus={(e) => e.target.select()}
+                  style={{
+                    width: '100%', padding: '7px 9px', fontSize: 12, fontFamily: 'monospace',
+                    border: '1px solid var(--border)', borderRadius: 5, boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }}
+                />
+                <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                  <button
+                    onClick={() => navigator.clipboard?.writeText(
+                      'cd ~/progetto.io && git pull && docker compose up -d --build'
+                    ).then(() => alert(t('linkCopied')), () => {})}
+                    style={{
+                      padding: '5px 12px', fontSize: 12, cursor: 'pointer', borderRadius: 5,
+                      border: 'none', backgroundColor: 'var(--accent)', color: 'var(--accentFg)',
+                    }}>
+                    {t('copyCommand')}
+                  </button>
+                  <span style={{ fontSize: 12, color: '#f59e0b' }}>⚠ {t('backupBeforeUpdate')}</span>
+                </div>
+              </div>
+            )}
+
+            {latestRelease && versionCompare(appVersion, latestRelease.tag) >= 0 && (
+              <div style={{ marginTop: 10, fontSize: 13, color: 'var(--muted)' }}>
+                ✅ {t('upToDate')}
+              </div>
+            )}
+          </div>
 
           <div style={{
             backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
@@ -3251,6 +3518,15 @@ const handleSaveActivity = async (activityData) => {
                     }}>
                     {t('copyLink')}
                   </button>
+                  {mailEnabled && deviceTech.email && (
+                    <button onClick={sendInviteEmail}
+                      style={{
+                        padding: '5px 12px', fontSize: 12, cursor: 'pointer', borderRadius: 5,
+                        border: '1px solid var(--border)', background: 'transparent', color: 'var(--fg)',
+                      }}>
+                      ✉ {t('sendByEmail')}
+                    </button>
+                  )}
                   <span style={{ fontSize: 12, color: 'var(--muted)' }}>
                     {t('expiresOn')} {new Date(newInvite.expires_at).toLocaleString(locale)}
                   </span>
@@ -3506,10 +3782,10 @@ const handleSaveActivity = async (activityData) => {
             width: '90%',
             maxWidth: '500px'
           }}>
-            <h3 style={{ marginTop: 0 }}>{editingUser ? 'Modifica Utente' : 'Nuovo Utente'}</h3>
+            <h3 style={{ marginTop: 0 }}>{editingUser ? t('editUser') : t('newUser')}</h3>
             <form onSubmit={handleCreateUser}>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Nome</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('name')}</label>
                 <input
                   type="text"
                   value={editingUser ? editingUser.name : newUser.name}
@@ -3527,7 +3803,7 @@ const handleSaveActivity = async (activityData) => {
                 />
               </div>
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Email</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('email')}</label>
                 <input
                   type="email"
                   value={editingUser ? editingUser.email : newUser.email}
@@ -3565,7 +3841,7 @@ const handleSaveActivity = async (activityData) => {
               </div>
               {!editingUser && (
 		<div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Password</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('password')}</label>
                 <input
                   type="password"
                   value={newUser.password}
@@ -3585,7 +3861,7 @@ const handleSaveActivity = async (activityData) => {
               </div>
 		)}
               <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>Ruolo</label>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('role')}</label>
                 <select
                   value={editingUser ? editingUser.role : newUser.role}
                   onChange={(e) => editingUser ? setEditingUser({ ...editingUser, role: e.target.value }) : setNewUser({ ...newUser, role: e.target.value })}

@@ -12,6 +12,24 @@
 :80 {
 	encode gzip
 
+	# Intestazioni di sicurezza. Valgono per tutte le risposte: le imposta il
+	# frontend e non il proxy esterno, cosi' restano anche cambiando proxy.
+	header {
+		# Impedisce di caricare l'applicazione dentro un iframe altrui
+		X-Frame-Options "DENY"
+		# Il browser non deve indovinare il tipo di contenuto
+		X-Content-Type-Options "nosniff"
+		# Non rivelare l'indirizzo interno navigando verso siti esterni
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Funzioni del dispositivo che l'applicazione non usa
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+		# Limita le sorgenti di script e connessioni. 'unsafe-inline' e'
+		# necessario per gli stili in linea di React e per la PWA.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.github.com; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		# Nasconde la tecnologia usata
+		-Server
+	}
+
 	# API verso il backend. Il percorso viene inoltrato intero,
 	# perche' il backend espone gia' le rotte sotto /api.
 	handle /api/* {

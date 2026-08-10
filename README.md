@@ -221,6 +221,14 @@ Le migrazioni sono automatiche. Consigliato un backup prima di aggiornare.
 
 ---
 
+## Documentazione
+
+| Documento | Contenuto |
+|---|---|
+| [GUIDA.md](GUIDA.md) | Guida rapida all'uso — italiano e inglese |
+| [PRIVACY.md](PRIVACY.md) | Dati trattati e verifiche per chi installa |
+| [SPEC.md](SPEC.md) | Scelte tecniche e architettura |
+
 ## Autore
 
 **Roberto Benassi** — [robertobenassi.com](https://robertobenassi.com)
