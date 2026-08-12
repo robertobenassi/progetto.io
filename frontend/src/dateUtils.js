@@ -15,7 +15,10 @@ export const halfUnit = (dateStr, half, isEnd) => {
 // periodo, non solo la prima. I campi start_half/end_half restano letti per
 // compatibilita' con i dati creati prima di questo modello.
 export const dayPartOf = (a) => {
-  if (a.day_part && ['AM', 'PM', 'FULL'].includes(a.day_part)) return a.day_part;
+  // Il valore viene ripulito: una colonna a lunghezza fissa restituirebbe
+  // 'AM  ' con spazi di riempimento, e il confronto fallirebbe in silenzio.
+  const dp = typeof a.day_part === 'string' ? a.day_part.trim().toUpperCase() : null;
+  if (dp && ['AM', 'PM', 'FULL'].includes(dp)) return dp;
   if (a.start_date === a.end_date) {
     if (a.start_half === 'PM' && a.end_half === 'PM') return 'PM';
     if (a.start_half === 'AM' && a.end_half === 'AM') return 'AM';
@@ -151,4 +154,17 @@ export const splitDays = (a, fromDate, toDate, refDate) => {
   }
 
   return { done, planned, total: done + planned };
+};
+
+// Due impegni si sovrappongono davvero?
+// Non basta il confronto fra date: mattina e pomeriggio dello stesso giorno
+// sono compatibili, e segnalarli come conflitto renderebbe inutile la
+// distinzione fra le fasce.
+export const activitiesOverlap = (a, b) => {
+  const s1 = new Date(a.start_date), e1 = new Date(a.end_date);
+  const s2 = new Date(b.start_date), e2 = new Date(b.end_date);
+  if (e1 < s2 || e2 < s1) return false;          // periodi disgiunti
+  const d1 = dayPartOf(a), d2 = dayPartOf(b);
+  if (d1 === 'FULL' || d2 === 'FULL') return true;
+  return d1 === d2;                               // AM con AM, PM con PM
 };

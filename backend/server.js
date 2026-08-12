@@ -325,8 +325,14 @@ const initDB = async () => {
     // mattine, che e' come si lavora nei collaudi.
     //   FULL = giornata intera · AM = solo mattina · PM = solo pomeriggio
     await pool.query(`
-      ALTER TABLE activities ADD COLUMN IF NOT EXISTS day_part CHAR(4) DEFAULT 'FULL';
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS day_part VARCHAR(4) DEFAULT 'FULL';
     `);
+    // CHAR(4) riempiva con spazi: 'AM' diventava 'AM  ' e i confronti fallivano.
+    // VARCHAR non ha questo comportamento. La conversione ripulisce i valori.
+    await pool.query(`
+      ALTER TABLE activities ALTER COLUMN day_part TYPE VARCHAR(4) USING TRIM(day_part);
+    `);
+    await pool.query(`UPDATE activities SET day_part = TRIM(day_part) WHERE day_part <> TRIM(day_part)`);
 
     // Conversione dal vecchio modello: se l'attivita' era di un solo giorno
     // e ne copriva meta', diventa AM o PM; tutto il resto e' giornata intera.

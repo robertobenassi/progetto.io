@@ -3,7 +3,7 @@ import { LANGUAGES, LOCALES, makeT } from './i18n';
 import Reports from './Reports';
 import {
   halfUnit, actStartUnit, actEndUnit, actDurationDays, dayPartOf,
-  addWorkingDays, countWorkingDays, calendarDays, toInputDate,
+  addWorkingDays, countWorkingDays, calendarDays, toInputDate, activitiesOverlap,
 } from './dateUtils';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
 import axios from 'axios';
@@ -727,11 +727,16 @@ const handleSaveActivity = async (activityData) => {
     });
 
     byTech.forEach((entry, techId) => {
-      const sorted = [...entry.list].sort((x, y) => actStartUnit(x) - actStartUnit(y));
+      const sorted = [...entry.list].sort((x, y) => new Date(x.start_date) - new Date(y.start_date));
       if (sorted.length < 2) return;
 
-      let cluster = [sorted[0]];
-      let maxEnd = actEndUnit(sorted[0]);
+      // Solo le attivita' realmente in conflitto entrano nei gruppi
+      const inConflitto = sorted.filter(a =>
+        sorted.some(b => b !== a && activitiesOverlap(a, b)));
+      if (inConflitto.length < 2) return;
+
+      let cluster = [inConflitto[0]];
+      let maxEnd = new Date(inConflitto[0].end_date);
 
       const flush = () => {
         if (cluster.length < 2) return;
@@ -748,15 +753,15 @@ const handleSaveActivity = async (activityData) => {
         });
       };
 
-      for (let i = 1; i < sorted.length; i++) {
-        const cur = sorted[i];
-        if (actStartUnit(cur) <= maxEnd) {
+      for (let i = 1; i < inConflitto.length; i++) {
+        const cur = inConflitto[i];
+        if (new Date(cur.start_date) <= maxEnd) {
           cluster.push(cur);
-          if (actEndUnit(cur) > maxEnd) maxEnd = actEndUnit(cur);
+          if (new Date(cur.end_date) > maxEnd) maxEnd = new Date(cur.end_date);
         } else {
           flush();
           cluster = [cur];
-          maxEnd = actEndUnit(cur);
+          maxEnd = new Date(cur.end_date);
         }
       }
       flush();
@@ -912,19 +917,21 @@ const handleSaveActivity = async (activityData) => {
     });
     const ids = new Set();
     byTech.forEach(list => {
-      const sorted = [...list].sort((x, y) => actStartUnit(x) - actStartUnit(y));
-      if (sorted.length < 2) return;
-      let maxItem = sorted[0];
-      let maxEnd = actEndUnit(sorted[0]);
-      for (let i = 1; i < sorted.length; i++) {
-        const cur = sorted[i];
-        if (actStartUnit(cur) <= maxEnd) {
-          ids.add(cur.id);
-          ids.add(maxItem.id);
-        }
-        if (actEndUnit(cur) > maxEnd) {
-          maxEnd = actEndUnit(cur);
-          maxItem = cur;
+      // Confronto a coppie invece dello scorrimento lineare: con le fasce
+      // orarie la sovrapposizione non e' piu' transitiva — mattina e
+      // pomeriggio dello stesso giorno non sono in conflitto fra loro.
+      // Il costo resta contenuto perche' si confrontano solo le attivita'
+      // dello stesso tecnico, non tutte fra loro.
+      const sorted = [...list].sort((x, y) => new Date(x.start_date) - new Date(y.start_date));
+      for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) {
+          // Ordinate per data: appena una inizia dopo la fine della prima,
+          // le successive non possono sovrapporsi.
+          if (new Date(sorted[j].start_date) > new Date(sorted[i].end_date)) break;
+          if (activitiesOverlap(sorted[i], sorted[j])) {
+            ids.add(sorted[i].id);
+            ids.add(sorted[j].id);
+          }
         }
       }
     });
@@ -945,10 +952,9 @@ const handleSaveActivity = async (activityData) => {
       byTech.get(x.technician_id).push(x);
     });
     activities.forEach(a => {
-      const s = actStartUnit(a), e = actEndUnit(a);
       (a.technicians || []).forEach(tc => {
         (byTech.get(tc.id) || []).forEach(ab => {
-          if (actStartUnit(ab) <= e && actEndUnit(ab) >= s) {
+          if (activitiesOverlap(a, ab)) {
             if (!m.has(a.id)) m.set(a.id, []);
             m.get(a.id).push({ tech: tc.name, type: ab.type, from: ab.start_date, to: ab.end_date });
           }
@@ -1057,29 +1063,49 @@ const handleSaveActivity = async (activityData) => {
       const rawStart = Math.round((s - first) / dayMs);
       const rawEnd   = Math.round((e - first) / dayMs);
 
-      // Bordi in mezze celle; il ritaglio ai margini del periodo visibile
-      // avviene dopo, per non perdere la mezza giornata sui bordi interni.
-      let left  = rawStart * DAY_W + (activity.start_half === 'PM' ? HALF : 0);
-      let right = rawEnd   * DAY_W + (activity.end_half === 'AM' ? HALF : DAY_W);
+      // La barra copre i giorni interi: la fascia oraria si rende con un
+      // motivo a mezze celle, non accorciando gli estremi. Con "solo mattina"
+      // su cinque giorni servono cinque mezze barrette, non una barra continua
+      // che finisce a meta' dell'ultimo giorno.
+      let left  = rawStart * DAY_W;
+      let right = rawEnd   * DAY_W + DAY_W;
 
       const maxRight = dates.length * DAY_W;
+      const tagliatoASinistra = left < 0;
       if (left < 0) left = 0;
       if (right > maxRight) right = maxRight;
       if (right <= left) return null;
 
-      return { left, width: right - left };
+      return { left, width: right - left, clippedLeft: tagliatoASinistra };
     };
 
-    // Giorni occupati nel periodo visibile (indicatore di carico)
-    // Conta in mezze giornate e restituisce i giorni (puo' essere 3,5)
+    // Motivo a mezze celle per le attivita' di sola mattina o solo pomeriggio.
+    // Un unico elemento con un gradiente ripetuto: nessun costo aggiuntivo
+    // rispetto a una barra piena.
+    const halfDayPattern = (activity, colore) => {
+      const dp = dayPartOf(activity);
+      if (dp === 'FULL') return undefined;
+      return dp === 'AM'
+        ? `repeating-linear-gradient(to right, ${colore} 0 ${HALF}px, transparent ${HALF}px ${DAY_W}px)`
+        : `repeating-linear-gradient(to right, transparent 0 ${HALF}px, ${colore} ${HALF}px ${DAY_W}px)`;
+    };
+
+    // Giorni occupati nel periodo visibile. Conta in mezze giornate: chi lavora
+    // solo le mattine occupa mezza unita' per ogni giorno.
     const loadDays = (acts) => {
       const busy = new Set();
       acts.forEach(a => {
         const p = barPos(a);
         if (!p) return;
-        const from = Math.round(p.left / HALF);
-        const to   = Math.round((p.left + p.width) / HALF);
-        for (let i = from; i < to; i++) busy.add(i);
+        const dp = dayPartOf(a);
+        const primaCella = Math.round(p.left / DAY_W);
+        const celle = Math.round(p.width / DAY_W);
+        for (let i = 0; i < celle; i++) {
+          const giorno = primaCella + i;
+          if (dp === 'FULL') { busy.add(giorno * 2); busy.add(giorno * 2 + 1); }
+          else if (dp === 'AM') busy.add(giorno * 2);
+          else busy.add(giorno * 2 + 1);
+        }
       });
       return busy.size / 2;
     };
@@ -1127,7 +1153,7 @@ const handleSaveActivity = async (activityData) => {
                   setSelectedTechnicians(techs.map(t => t.id));
                   setShowEditModal(true);
                 }}
-                title={`${onLeave ? '⚠ ' + t('duringAbsence') + ': ' + absenceConflicts.get(activity.id).map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${activity.name} — ${activity.start_date}${activity.start_half === 'PM' ? ' (' + t('afternoon') + ')' : ''} → ${activity.end_date}${activity.end_half === 'AM' ? ' (' + t('morning') + ')' : ''} — ${actDurationDays(activity)} ${t('calendarDays')}`}
+                title={`${onLeave ? '⚠ ' + t('duringAbsence') + ': ' + absenceConflicts.get(activity.id).map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${activity.name} — ${activity.start_date} → ${activity.end_date}${dayPartOf(activity) === 'AM' ? ' — ' + t('onlyMorning') : dayPartOf(activity) === 'PM' ? ' — ' + t('onlyAfternoon') : ''} — ${actDurationDays(activity)} ${t('calendarDays')}`}
                 style={{
                   position: 'absolute', top: 8, height: ROW_H - 16,
                   left: pos.left, width: pos.width,
@@ -1135,14 +1161,18 @@ const handleSaveActivity = async (activityData) => {
                   // da un tecnico che ha scelto il rosso come proprio colore.
                   // Striature diagonali e bordo marcato funzionano con qualsiasi
                   // colore e restano leggibili anche a chi non distingue i rossi.
-                  backgroundColor: color || '#555555',
-                  backgroundImage: conflict
-                    ? 'repeating-linear-gradient(45deg, rgba(0,0,0,0.55) 0 5px, rgba(255,255,255,0.30) 5px 10px)'
-                    : undefined,
+                  // Fascia oraria come motivo a mezze celle; il conflitto come
+                  // striature diagonali sopra. I due livelli convivono.
+                  backgroundColor: dayPartOf(activity) === 'FULL' ? (color || '#555555') : 'transparent',
+                  backgroundImage: [
+                    conflict ? 'repeating-linear-gradient(45deg, rgba(0,0,0,0.55) 0 5px, rgba(255,255,255,0.30) 5px 10px)' : null,
+                    halfDayPattern(activity, color || '#555555'),
+                  ].filter(Boolean).join(', ') || undefined,
                   borderRadius: 4, cursor: 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   fontSize: 12, color: 'white', fontWeight: 500,
-                  border: conflict ? '2px solid #ef4444' : '1px solid var(--border)',
+                  border: conflict ? '2px solid #ef4444'
+                        : (dayPartOf(activity) === 'FULL' ? '1px solid var(--border)' : 'none'),
                   boxSizing: 'border-box',
                   overflow: 'hidden', whiteSpace: 'nowrap',
                 }}>
@@ -1428,7 +1458,8 @@ const handleSaveActivity = async (activityData) => {
                             style={{
                               position: 'absolute', top: 14, height: 20,
                               left: p.left, width: p.width,
-                              backgroundColor: prj?.color || '#555555',
+                              backgroundColor: dayPartOf(a) === 'FULL' ? (prj?.color || '#555555') : 'transparent',
+                              backgroundImage: halfDayPattern(a, prj?.color || '#555555'),
                               borderRadius: 3, opacity: 0.85,
                               fontSize: 10, color: 'white',
                               display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2272,14 +2303,13 @@ const handleSaveActivity = async (activityData) => {
                                         </td>
                                         <td style={{ padding: '7px 12px', whiteSpace: 'nowrap' }}>
                                           {new Date(activity.start_date).toLocaleDateString(locale)}
-                                          {activity.start_half === 'PM' && (
-                                            <span style={{ color: 'var(--muted)', fontSize: 11 }}> ({t('afternoon')})</span>
-                                          )}
                                         </td>
                                         <td style={{ padding: '7px 12px', whiteSpace: 'nowrap' }}>
                                           {new Date(activity.end_date).toLocaleDateString(locale)}
-                                          {activity.end_half === 'AM' && (
-                                            <span style={{ color: 'var(--muted)', fontSize: 11 }}> ({t('morning')})</span>
+                                          {dayPartOf(activity) !== 'FULL' && (
+                                            <span style={{ color: 'var(--muted)', fontSize: 11 }}>
+                                              {' '}({dayPartOf(activity) === 'AM' ? t('onlyMorning') : t('onlyAfternoon')})
+                                            </span>
                                           )}
                                         </td>
                                         <td style={{ padding: '7px 12px', whiteSpace: 'nowrap' }}>
