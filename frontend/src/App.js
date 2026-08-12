@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { LANGUAGES, LOCALES, makeT } from './i18n';
 import Reports from './Reports';
-import { halfUnit, actStartUnit, actEndUnit, actDurationDays } from './dateUtils';
+import {
+  halfUnit, actStartUnit, actEndUnit, actDurationDays, dayPartOf,
+  addWorkingDays, countWorkingDays, calendarDays, toInputDate,
+} from './dateUtils';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
 import axios from 'axios';
 
@@ -78,6 +81,8 @@ const App = () => {
   const [mailEnabled, setMailEnabled] = useState(false);
   const [appVersion, setAppVersion] = useState('');
   const [latestRelease, setLatestRelease] = useState(null);
+  const [license, setLicense] = useState(null);
+  const [licenseKey, setLicenseKey] = useState('');
   const [showForgot, setShowForgot] = useState(false);
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotMsg, setForgotMsg] = useState('');
@@ -198,8 +203,11 @@ const App = () => {
   const PROJECTS_PER_PAGE = 25;
   const [formStart, setFormStart] = useState('');
   const [formEnd, setFormEnd] = useState('');
-  const [formStartHalf, setFormStartHalf] = useState('AM');
-  const [formEndHalf, setFormEndHalf] = useState('PM');
+  const [formDayPart, setFormDayPart] = useState('FULL');
+  const [formWorkDays, setFormWorkDays] = useState('');
+  const [techSearch, setTechSearch] = useState('');
+  const [holidays, setHolidays] = useState([]);
+  const [weekendMap, setWeekendMap] = useState({});
   const [showUserModal, setShowUserModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [newUser, setNewUser] = useState({ email: '', password: '', name: '', role: 'viewer', phone: '', countries: [] });
@@ -216,6 +224,8 @@ const App = () => {
       fetchProjects();
       fetchTechnicians();
       fetchAbsences();
+      fetchLicense();
+      fetchHolidays();
       fetchActivities();
       if (user.role === 'admin') {
         fetchUsers();
@@ -356,6 +366,32 @@ const App = () => {
 
   // Il confronto lo fa il browser contattando GitHub: il backend sta su una
   // rete isolata e non vede Internet. Nessun dato lascia il server.
+  const fetchLicense = async () => {
+    try {
+      const r = await axios.get(`${API_URL}/license`);
+      setLicense(r.data);
+    } catch { setLicense({ licensed: false }); }
+  };
+
+  const saveLicense = async () => {
+    try {
+      const r = await axios.post(`${API_URL}/license`, { key: licenseKey.trim() });
+      alert(`${t('licenseRegistered')}: ${r.data.to}`);
+      setLicenseKey('');
+      fetchLicense();
+    } catch (err) {
+      alert(err.response?.data?.message || t('licenseInvalid'));
+    }
+  };
+
+  const removeLicense = async () => {
+    if (!window.confirm(t('licenseRemoveConfirm'))) return;
+    try {
+      await axios.delete(`${API_URL}/license`);
+      fetchLicense();
+    } catch { alert('Errore'); }
+  };
+
   const versionCompare = (a, b) => {
     const pa = String(a).replace(/^v/, '').split('.').map(Number);
     const pb = String(b).replace(/^v/, '').split('.').map(Number);
@@ -444,6 +480,14 @@ const App = () => {
     } catch (error) {
       alert(error.response?.data?.message || 'Errore durante la revoca');
     }
+  };
+
+  const fetchHolidays = async () => {
+    try {
+      const r = await axios.get(`${API_URL}/holidays`);
+      setHolidays(r.data.holidays || []);
+      setWeekendMap(r.data.weekend || {});
+    } catch { setHolidays([]); }
   };
 
   const fetchAbsences = async () => {
@@ -749,28 +793,66 @@ const handleSaveActivity = async (activityData) => {
 
   // Cambiando l'inizio, la fine trasla della stessa durata (come MS Project / Jira).
   // Cambiando la fine, l'inizio resta fermo: e' cosi' che si accorcia o allunga.
+
+  const projectsById = useMemo(() => {
+    const m = new Map();
+    projects.forEach(p => m.set(p.id, p));
+    return m;
+  }, [projects]);
+
+  // Nazione del progetto selezionato: decide festivi e giorni di riposo
+  const formCountry = useMemo(() => {
+    const pid = editingActivity?.project_id;
+    return projectsById.get(pid)?.country || 'IT';
+  }, [editingActivity, projectsById]);
+
   const handleStartChange = (value) => {
     if (!value) { setFormStart(value); return; }
-    if (formStart && formEnd) {
+    setFormStart(value);
+    // Se e' stata indicata una durata, la fine si ricalcola sui giorni
+    // lavorativi della nazione del progetto.
+    if (formWorkDays) {
+      setFormEnd(addWorkingDays(value, formWorkDays, formCountry, holidays, weekendMap));
+    } else if (formStart && formEnd) {
       const dur = daysBetween(formStart, formEnd);
       if (dur >= 0) setFormEnd(addDays(value, dur));
     } else if (!formEnd) {
       setFormEnd(value);
     }
-    setFormStart(value);
   };
 
-  const startUnit = formStart ? halfUnit(formStart, formStartHalf, false) : null;
-  const endUnit   = formEnd ? halfUnit(formEnd, formEndHalf, true) : null;
-  const dateError = Boolean(formStart && formEnd && endUnit < startUnit);
-  const durationDays = (formStart && formEnd && !dateError) ? (endUnit - startUnit + 1) / 2 : null;
+  const handleWorkDaysChange = (value) => {
+    setFormWorkDays(value);
+    if (value && formStart) {
+      setFormEnd(addWorkingDays(formStart, value, formCountry, holidays, weekendMap));
+    }
+  };
+
+  // Modificando la fine a mano il vincolo dei giorni lavorativi decade:
+  // e' il modo per forzare un intervento nel fine settimana o in un festivo.
+  const handleEndChange = (value) => {
+    setFormEnd(value);
+    setFormWorkDays('');
+  };
+
+  const dateError = Boolean(formStart && formEnd && new Date(formEnd) < new Date(formStart));
+  const giorniCalendario = (formStart && formEnd && !dateError)
+    ? calendarDays({ start_date: formStart, end_date: formEnd }) : null;
+  const durationDays = giorniCalendario
+    ? giorniCalendario * (formDayPart === 'FULL' ? 1 : 0.5) : null;
+  const giorniLavorativi = (formStart && formEnd && !dateError)
+    ? countWorkingDays(formStart, formEnd, formCountry, holidays, weekendMap) : null;
+  // Segnalazione, non blocco: negli impianti si interviene proprio nei fermi
+  const includeNonLavorativi = Boolean(giorniCalendario && giorniLavorativi !== null
+    && giorniLavorativi < giorniCalendario);
 
   useEffect(() => {
     if (showActivityModal || showEditModal) {
       setFormStart(editingActivity?.start_date ? formatDateForInput(editingActivity.start_date) : '');
       setFormEnd(editingActivity?.end_date ? formatDateForInput(editingActivity.end_date) : '');
-      setFormStartHalf(editingActivity?.start_half === 'PM' ? 'PM' : 'AM');
-      setFormEndHalf(editingActivity?.end_half === 'AM' ? 'AM' : 'PM');
+      setFormDayPart(editingActivity ? dayPartOf(editingActivity) : 'FULL');
+      setFormWorkDays('');
+      setTechSearch('');
     }
   }, [showActivityModal, showEditModal, editingActivity]);
 
@@ -849,11 +931,7 @@ const handleSaveActivity = async (activityData) => {
     return ids;
   }, [activities]);
 
-  const projectsById = useMemo(() => {
-    const m = new Map();
-    projects.forEach(p => m.set(p.id, p));
-    return m;
-  }, [projects]);
+
 
   // Un'attivita' assegnata a un tecnico durante una sua assenza e' un conflitto,
   // ma di natura diversa dalla doppia assegnazione: va segnalato, mai impedito.
@@ -1617,7 +1695,18 @@ const handleSaveActivity = async (activityData) => {
           <h1 style={{
             color: 'var(--barFg)', margin: 0, fontSize: '1.05rem',
             fontWeight: 700, letterSpacing: '0.02em',
-          }}>Progetto.io</h1>
+            display: 'flex', alignItems: 'center', gap: 8,
+          }}>
+            Progetto.io
+            {license && !license.licensed && (
+              <span title={t('licenseNonCommercial')} style={{
+                fontSize: 10, fontWeight: 400, padding: '1px 7px', borderRadius: 10,
+                border: '1px solid var(--barFg)', opacity: 0.65, whiteSpace: 'nowrap',
+              }}>
+                {t('nonCommercial')}
+              </span>
+            )}
+          </h1>
         </div>
 
         <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
@@ -2829,7 +2918,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Salva
+                  {t('save')}
                 </button>
                 <button
                   type="button"
@@ -2848,7 +2937,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Annulla
+                  {t('cancel')}
                 </button>
               </div>
             </form>
@@ -2980,7 +3069,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Salva
+                  {t('save')}
                 </button>
                 <button
                   type="button"
@@ -2999,7 +3088,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Annulla
+                  {t('cancel')}
                 </button>
               </div>
             </form>
@@ -3023,12 +3112,17 @@ const handleSaveActivity = async (activityData) => {
         }}>
           <div style={{
             backgroundColor: 'var(--surface)',
-            padding: '2rem',
-            borderRadius: '10px',
-            width: '90%',
-            maxWidth: '600px'
+            padding: '1.25rem 1.5rem',
+            borderRadius: 10,
+            width: '95%',
+            maxWidth: 860,
+            maxHeight: '92vh',
+            overflowY: 'auto',
+            border: '1px solid var(--border)',
           }}>
-            <h3 style={{ marginTop: 0 }}>{editingActivity?.id ? t('editActivity') : t('newActivity')}</h3>
+            <h3 style={{ marginTop: 0, marginBottom: '0.9rem' }}>
+              {editingActivity?.id ? t('editActivity') : t('newActivity')}
+            </h3>
             <form onSubmit={(e) => {
               e.preventDefault();
               if (dateError) return;
@@ -3039,11 +3133,20 @@ const handleSaveActivity = async (activityData) => {
                 technician_ids: selectedTechnicians,
                 start_date: formStart,
                 end_date: formEnd,
-                start_half: formStartHalf,
-                end_half: formEndHalf,
+                day_part: formDayPart,
                 progress: parseInt(formData.get('progress'))
               });
             }}>
+              {/* Due colonne: su un portatile la disposizione verticale usciva
+                  dallo schermo. La griglia collassa a una colonna sotto i 700px. */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+                gap: '0 1.5rem',
+                alignItems: 'start',
+              }}>
+
+              <div>
               <div style={{ marginBottom: '1rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('activityName')}</label>
                 <input
@@ -3088,34 +3191,8 @@ const handleSaveActivity = async (activityData) => {
 
 
 
-		<div style={{ marginBottom: '1rem' }}>
-  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('technicians')}</label>
-  <div style={{ border: '1px solid var(--border)', borderRadius: '5px', padding: '10px', maxHeight: '150px', overflowY: 'auto' }}>
-    {technicians.map(tech => (
-      <div key={tech.id} style={{ marginBottom: '5px' }}>
-        <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
-          <input
-  type="checkbox"
-  name="technician_ids"
-  value={tech.id}
-  checked={selectedTechnicians.includes(tech.id)}
-  onChange={(e) => {
-    if (e.target.checked) {
-      setSelectedTechnicians([...selectedTechnicians, tech.id]);
-    } else {
-      setSelectedTechnicians(selectedTechnicians.filter(id => id !== tech.id));
-    }
-  }}
-  style={{ marginRight: '8px' }}
-/>
-          {tech.name}
-        </label>
-      </div>
-    ))}
-  </div>
-</div>
-              <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem' }}>
-                <div style={{ flex: 1 }}>
+              <div style={{ display: 'flex', gap: '1rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                <div style={{ flex: 1, minWidth: 150 }}>
                   <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('startDate')}</label>
                   <input
                     name="start_date"
@@ -3124,65 +3201,72 @@ const handleSaveActivity = async (activityData) => {
                     onChange={(e) => handleStartChange(e.target.value)}
                     required
                     style={{
-                      width: '100%',
-                      padding: '0.5rem',
-                      border: '1px solid var(--border)',
-                      borderRadius: '5px',
-                      boxSizing: 'border-box'
+                      width: '100%', padding: '0.5rem', borderRadius: '5px',
+                      border: '1px solid var(--border)', boxSizing: 'border-box',
+                      backgroundColor: 'var(--surface)', color: 'var(--fg)',
                     }}
                   />
-                  <select
-                    value={formStartHalf}
-                    onChange={(e) => setFormStartHalf(e.target.value)}
-                    style={{
-                      width: '100%',
-                      marginTop: '0.4rem',
-                      padding: '0.5rem',
-                      border: '1px solid var(--border)',
-                      borderRadius: '5px',
-                      backgroundColor: 'var(--surface)',
-                      boxSizing: 'border-box'
-                    }}
-                  >
-                    <option value="AM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('morning')}</option>
-                    <option value="PM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('afternoon')}</option>
-                  </select>
                 </div>
-                <div style={{ flex: 1 }}>
+
+                <div style={{ width: 110 }}>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>
+                    {t('workDays')}
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={formWorkDays}
+                    onChange={(e) => handleWorkDaysChange(e.target.value)}
+                    placeholder="—"
+                    title={t('workDaysHint')}
+                    style={{
+                      width: '100%', padding: '0.5rem', borderRadius: '5px',
+                      border: '1px solid var(--border)', boxSizing: 'border-box',
+                      backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                    }}
+                  />
+                </div>
+
+                <div style={{ flex: 1, minWidth: 150 }}>
                   <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('endDate')}</label>
                   <input
                     name="end_date"
                     type="date"
                     value={formEnd}
                     min={formStart || undefined}
-                    onChange={(e) => setFormEnd(e.target.value)}
+                    onChange={(e) => handleEndChange(e.target.value)}
                     required
                     style={{
-                      width: '100%',
-                      padding: '0.5rem',
+                      width: '100%', padding: '0.5rem', borderRadius: '5px',
                       border: dateError ? '2px solid #ef4444' : '1px solid var(--border)',
-                      borderRadius: '5px',
                       boxSizing: 'border-box',
-                      backgroundColor: dateError ? 'var(--surface2)' : 'white'
+                      backgroundColor: dateError ? 'var(--surface2)' : 'var(--surface)',
+                      color: 'var(--fg)',
                     }}
                   />
-                  <select
-                    value={formEndHalf}
-                    onChange={(e) => setFormEndHalf(e.target.value)}
-                    style={{
-                      width: '100%',
-                      marginTop: '0.4rem',
-                      padding: '0.5rem',
-                      borderRadius: '5px',
-                      backgroundColor: dateError ? 'var(--surface2)' : 'white',
-                      border: dateError ? '2px solid #ef4444' : '1px solid var(--border)',
-                      boxSizing: 'border-box'
-                    }}
-                  >
-                    <option value="AM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('morning')}</option>
-                    <option value="PM" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{t('afternoon')}</option>
-                  </select>
                 </div>
+              </div>
+
+              {/* Fascia oraria: vale per tutta la durata dell'attivita'.
+                  Le due caselle si escludono a vicenda; nessuna spuntata
+                  significa giornata intera. */}
+              <div style={{ display: 'flex', gap: 18, marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 14, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={formDayPart === 'AM'}
+                    onChange={(e) => setFormDayPart(e.target.checked ? 'AM' : 'FULL')}
+                  />
+                  {t('onlyMorning')}
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 14, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={formDayPart === 'PM'}
+                    onChange={(e) => setFormDayPart(e.target.checked ? 'PM' : 'FULL')}
+                  />
+                  {t('onlyAfternoon')}
+                </label>
               </div>
 
               <div style={{ marginBottom: '1rem', minHeight: '20px' }}>
@@ -3193,6 +3277,14 @@ const handleSaveActivity = async (activityData) => {
                 ) : durationDays ? (
                   <span style={{ color: 'var(--muted)', fontSize: '0.85rem' }}>
                     {t('duration')}: {durationDays} {durationDays === 1 ? t('oneDay') : t('calendarDays')}
+                    {giorniLavorativi !== null && (
+                      <> · {giorniLavorativi} {t('workingDays')}</>
+                    )}
+                    {includeNonLavorativi && (
+                      <span style={{ color: '#f59e0b', marginLeft: 8 }}>
+                        ⚠ {t('includesNonWorking')}
+                      </span>
+                    )}
                   </span>
                 ) : null}
               </div>
@@ -3216,6 +3308,123 @@ const handleSaveActivity = async (activityData) => {
                   }}
                 />
               </div>
+              </div>
+
+              <div>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>
+                  {t('technicians')}
+                  {selectedTechnicians.length > 0 && (
+                    <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 8, fontSize: '0.85rem' }}>
+                      {selectedTechnicians.length} {t('selected')}
+                    </span>
+                  )}
+                </label>
+
+                {/* Chi e' gia' selezionato resta sempre visibile: con molti
+                    tecnici, scorrere l'elenco per capire chi si e' scelto
+                    e' il momento in cui si sbaglia. */}
+                {selectedTechnicians.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                    {selectedTechnicians.map(id => {
+                      const tc = technicians.find(x => x.id === id);
+                      if (!tc) return null;
+                      return (
+                        <span key={id}
+                          onClick={() => setSelectedTechnicians(selectedTechnicians.filter(x => x !== id))}
+                          title={t('removeFromSelection')}
+                          style={{
+                            display: 'inline-flex', alignItems: 'center', gap: 6,
+                            padding: '3px 9px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                            backgroundColor: tc.color || '#555555', color: 'white',
+                          }}>
+                          {tc.name} <strong>×</strong>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <input
+                  type="text"
+                  value={techSearch}
+                  onChange={(e) => setTechSearch(e.target.value)}
+                  placeholder={t('searchTechnician')}
+                  style={{
+                    width: '100%', padding: '0.45rem 0.6rem', marginBottom: 6,
+                    borderRadius: 5, border: '1px solid var(--border)', boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)', fontSize: 13,
+                  }}
+                />
+
+                <div style={{
+                  border: '1px solid var(--border)', borderRadius: 5,
+                  padding: 8, maxHeight: 170, overflowY: 'auto',
+                  backgroundColor: 'var(--surface)',
+                }}>
+                  {(() => {
+                    const q = techSearch.trim().toLowerCase();
+                    const elenco = technicians
+                      .filter(tc => !q
+                        || tc.name.toLowerCase().includes(q)
+                        || (tc.specialization || '').toLowerCase().includes(q))
+                      // I selezionati in cima: restano a portata anche cercando
+                      .sort((a, b) => {
+                        const sa = selectedTechnicians.includes(a.id) ? 0 : 1;
+                        const sb = selectedTechnicians.includes(b.id) ? 0 : 1;
+                        return sa - sb || a.name.localeCompare(b.name);
+                      });
+
+                    if (!elenco.length) {
+                      return <div style={{ fontSize: 13, color: 'var(--muted)', padding: '4px 2px' }}>
+                        {t('noResults')}
+                      </div>;
+                    }
+
+                    return elenco.map(tech => {
+                      const sel = selectedTechnicians.includes(tech.id);
+                      return (
+                        <label key={tech.id}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 8,
+                            padding: '4px 6px', borderRadius: 4, cursor: 'pointer',
+                            backgroundColor: sel ? 'var(--surface2)' : 'transparent',
+                          }}>
+                          <input
+                            type="checkbox"
+                            name="technician_ids"
+                            value={tech.id}
+                            checked={sel}
+                            onChange={(e) => {
+                              if (e.target.checked) setSelectedTechnicians([...selectedTechnicians, tech.id]);
+                              else setSelectedTechnicians(selectedTechnicians.filter(id => id !== tech.id));
+                            }}
+                          />
+                          <span style={{
+                            width: 9, height: 9, borderRadius: '50%', flexShrink: 0,
+                            backgroundColor: tech.color || '#555555',
+                          }} />
+                          <span style={{ fontSize: 14 }}>{tech.name}</span>
+                          {tech.home_country && (
+                            <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                              {countryFlag(tech.home_country)}
+                            </span>
+                          )}
+                          {tech.specialization && (
+                            <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>
+                              {tech.specialization}
+                            </span>
+                          )}
+                        </label>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+              </div>
+
+              </div>
+
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
                   type="submit"
@@ -3231,7 +3440,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Salva
+                  {t('save')}
                 </button>
                 <button
                   type="button"
@@ -3252,7 +3461,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Annulla
+                  {t('cancel')}
                 </button>
               </div>
             </form>
@@ -3268,6 +3477,94 @@ const handleSaveActivity = async (activityData) => {
           <p style={{ margin: '0 0 1rem 0', fontSize: 13, color: 'var(--muted)' }}>
             {t('maintenanceHint')}
           </p>
+
+          {/* Licenza */}
+          <div style={{
+            backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 8, padding: '1rem', marginBottom: '1rem',
+          }}>
+            <h3 style={{ marginTop: 0, fontSize: '1rem' }}>🔑 {t('license')}</h3>
+
+            {license?.licensed && !license?.expired && (
+              <div style={{
+                padding: '0.8rem', borderRadius: 6, marginBottom: 10,
+                border: '1px solid var(--border)', backgroundColor: 'var(--surface2)',
+              }}>
+                <div style={{ fontWeight: 700, fontSize: 14 }}>✅ {t('licenseCommercial')}</div>
+                <div style={{ fontSize: 13, marginTop: 4 }}>
+                  {t('licensedTo')}: <strong>{license.to}</strong>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2 }}>
+                  {license.expires
+                    ? `${t('validUntil')} ${new Date(license.expires).toLocaleDateString(locale)}`
+                    : t('perpetual')}
+                  {license.seats ? ` · ${license.seats} ${t('seats')}` : ''}
+                  {license.id ? ` · ${license.id}` : ''}
+                </div>
+              </div>
+            )}
+
+            {license?.licensed && license?.expired && (
+              <div style={{
+                padding: '0.8rem', borderRadius: 6, marginBottom: 10,
+                border: '2px solid #f59e0b', backgroundColor: 'var(--surface2)',
+              }}>
+                <div style={{ fontWeight: 700, fontSize: 14, color: '#f59e0b' }}>
+                  ⚠ {t('licenseExpired')}
+                </div>
+                <div style={{ fontSize: 13, marginTop: 4 }}>
+                  {license.to} — {t('expiredOn')} {new Date(license.expires).toLocaleDateString(locale)}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>
+                  {t('licenseExpiredHint')}
+                </div>
+              </div>
+            )}
+
+            {!license?.licensed && (
+              <div style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 10 }}>
+                {t('licenseNonCommercial')}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <input
+                type="text"
+                value={licenseKey}
+                onChange={(e) => setLicenseKey(e.target.value)}
+                placeholder={t('licensePaste')}
+                style={{
+                  flex: 1, minWidth: 260, padding: '7px 10px', fontSize: 12,
+                  fontFamily: 'monospace', borderRadius: 5,
+                  border: '1px solid var(--border)',
+                  backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                }}
+              />
+              <button onClick={saveLicense} disabled={!licenseKey.trim()}
+                style={{
+                  padding: '7px 14px', fontSize: 13, borderRadius: 5, border: 'none',
+                  backgroundColor: licenseKey.trim() ? 'var(--accent)' : 'var(--border)',
+                  color: 'var(--accentFg)', fontWeight: 600,
+                  cursor: licenseKey.trim() ? 'pointer' : 'not-allowed',
+                }}>
+                {license?.licensed ? t('licenseReplace') : t('licenseActivate')}
+              </button>
+              {license?.licensed && (
+                <button onClick={removeLicense}
+                  style={{
+                    padding: '7px 12px', fontSize: 13, borderRadius: 5,
+                    border: '1px solid var(--border)', background: 'transparent',
+                    color: '#ef4444', cursor: 'pointer',
+                  }}>
+                  {t('delete')}
+                </button>
+              )}
+            </div>
+
+            <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>
+              {t('licenseHint')}
+            </div>
+          </div>
 
           {/* Aggiornamenti */}
           <div style={{
@@ -3968,7 +4265,7 @@ const handleSaveActivity = async (activityData) => {
                     fontWeight: '600'
                   }}
                 >
-                  Annulla
+                  {t('cancel')}
                 </button>
               </div>
             </form>

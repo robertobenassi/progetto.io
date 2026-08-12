@@ -286,6 +286,16 @@ const initDB = async () => {
     `);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS license (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        key TEXT NOT NULL,
+        installed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        installed_by VARCHAR(255),
+        CONSTRAINT una_sola_licenza CHECK (id = 1)
+      );
+    `);
+
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_devices_tech  ON technician_devices(technician_id);
       CREATE INDEX IF NOT EXISTS idx_devices_token ON technician_devices(token_hash);
       CREATE INDEX IF NOT EXISTS idx_invites_tech  ON technician_invites(technician_id);
@@ -308,6 +318,58 @@ const initDB = async () => {
     await pool.query(`
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS start_half CHAR(2) DEFAULT 'AM';
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS end_half CHAR(2) DEFAULT 'PM';
+    `);
+
+    // Nuovo modello delle mezze giornate: la fascia vale per TUTTA l'attivita',
+    // non per i singoli estremi. "Solo mattina" su tre giorni significa tre
+    // mattine, che e' come si lavora nei collaudi.
+    //   FULL = giornata intera · AM = solo mattina · PM = solo pomeriggio
+    await pool.query(`
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS day_part CHAR(4) DEFAULT 'FULL';
+    `);
+
+    // Conversione dal vecchio modello: se l'attivita' era di un solo giorno
+    // e ne copriva meta', diventa AM o PM; tutto il resto e' giornata intera.
+    await pool.query(`
+      UPDATE activities SET day_part =
+        CASE
+          WHEN start_date = end_date AND start_half = 'AM' AND end_half = 'AM' THEN 'AM'
+          WHEN start_date = end_date AND start_half = 'PM' AND end_half = 'PM' THEN 'PM'
+          ELSE 'FULL'
+        END
+      WHERE day_part IS NULL OR day_part = 'FULL'
+    `);
+
+    // Festivi per nazione. Una tabella e non una libreria: servono anche le
+    // chiusure aziendali e i ponti, che nessuna libreria conosce.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS holidays (
+        id SERIAL PRIMARY KEY,
+        country CHAR(2) NOT NULL,
+        date DATE NOT NULL,
+        name VARCHAR(160),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(country, date)
+      );
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_holidays_country_date ON holidays(country, date);
+    `);
+
+    // Giorni non lavorativi per nazione. Non ovunque il fine settimana e'
+    // sabato-domenica: in Arabia Saudita, Egitto e Qatar e' venerdi-sabato.
+    // Numerazione JavaScript: 0 = domenica ... 6 = sabato.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS country_weekend (
+        country CHAR(2) PRIMARY KEY,
+        days INTEGER[] NOT NULL DEFAULT '{0,6}'
+      );
+    `);
+    await pool.query(`
+      INSERT INTO country_weekend (country, days) VALUES
+        ('SA','{5,6}'), ('EG','{5,6}'), ('QA','{5,6}'), ('KW','{5,6}'),
+        ('AE','{6,0}'), ('BH','{5,6}'), ('OM','{5,6}'), ('IL','{5,6}')
+      ON CONFLICT (country) DO NOTHING
     `);
 
     // Indici: necessari con centinaia di progetti e migliaia di attivita'
@@ -556,11 +618,14 @@ app.get('/api/activities', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
-  const { name, project_id, technician_ids, start_date, end_date, progress, start_half, end_half } = req.body;
-  const sHalf = start_half === 'PM' ? 'PM' : 'AM';
-  const eHalf = end_half === 'AM' ? 'AM' : 'PM';
+  const { name, project_id, technician_ids, start_date, end_date, progress, day_part } = req.body;
+  // day_part vale per tutta l'attivita'. I vecchi campi start_half/end_half
+  // restano popolati in modo coerente per non rompere i dati esistenti.
+  const dp = ['AM', 'PM'].includes(day_part) ? day_part : 'FULL';
+  const sHalf = dp === 'PM' ? 'PM' : 'AM';
+  const eHalf = dp === 'AM' ? 'AM' : 'PM';
 
-  const dateError = validateActivityDates(start_date, end_date, sHalf, eHalf);
+  const dateError = validateActivityDates(start_date, end_date, 'AM', 'PM');
   if (dateError) {
     return res.status(400).json({ message: dateError });
   }
@@ -576,8 +641,8 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
     
     // Crea l'attività
     const result = await client.query(
-      'INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [name, project_id, start_date, end_date, progress || 0, sHalf, eHalf]
+      'INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half, day_part) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [name, project_id, start_date, end_date, progress || 0, sHalf, eHalf, dp]
     );
     
     const activity = result.rows[0];
@@ -610,11 +675,12 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
 
 app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
-  const { name, project_id, technician_ids, start_date, end_date, progress, start_half, end_half } = req.body;
-  const sHalf = start_half === 'PM' ? 'PM' : 'AM';
-  const eHalf = end_half === 'AM' ? 'AM' : 'PM';
+  const { name, project_id, technician_ids, start_date, end_date, progress, day_part } = req.body;
+  const dp = ['AM', 'PM'].includes(day_part) ? day_part : 'FULL';
+  const sHalf = dp === 'PM' ? 'PM' : 'AM';
+  const eHalf = dp === 'AM' ? 'AM' : 'PM';
 
-  const dateError = validateActivityDates(start_date, end_date, sHalf, eHalf);
+  const dateError = validateActivityDates(start_date, end_date, 'AM', 'PM');
   if (dateError) {
     return res.status(400).json({ message: dateError });
   }
@@ -635,8 +701,8 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
     
     // Aggiorna l'attività
     const result = await client.query(
-      'UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5, start_half = $6, end_half = $7 WHERE id = $8 RETURNING *',
-      [name, project_id, start_date, end_date, progress, sHalf, eHalf, id]
+      'UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5, start_half = $6, end_half = $7, day_part = $8 WHERE id = $9 RETURNING *',
+      [name, project_id, start_date, end_date, progress, sHalf, eHalf, dp, id]
     );
     
     // Rimuovi vecchie associazioni
@@ -773,6 +839,204 @@ app.delete('/api/technicians/:id', authenticateToken, authorize(['admin']), asyn
 });
 
 // USERS
+// ---------------------------------------------------------------------------
+// Festivi e giorni lavorativi
+// ---------------------------------------------------------------------------
+app.get('/api/holidays', authenticateToken, async (req, res) => {
+  const { country, year } = req.query;
+  const where = [];
+  const params = [];
+  if (country) { params.push(country.toUpperCase()); where.push(`country = $${params.length}`); }
+  if (year) { params.push(year); where.push(`EXTRACT(YEAR FROM date) = $${params.length}`); }
+  try {
+    const r = await pool.query(
+      `SELECT id, country, date, name FROM holidays
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY date`, params);
+    const w = await pool.query('SELECT country, days FROM country_weekend');
+    const weekend = {};
+    w.rows.forEach(x => { weekend[x.country] = x.days; });
+    res.json({ holidays: r.rows, weekend });
+  } catch (error) {
+    console.error('Errore lettura festivi:', error);
+    res.status(500).json({ message: 'Errore durante il recupero dei festivi' });
+  }
+});
+
+app.post('/api/holidays', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { country, date, name } = req.body || {};
+  if (!country || !date) return res.status(400).json({ message: 'Nazione e data obbligatorie' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO holidays (country, date, name) VALUES ($1,$2,$3)
+       ON CONFLICT (country, date) DO UPDATE SET name = $3 RETURNING *`,
+      [String(country).toUpperCase(), date, name || null]);
+    await logAudit(req, {
+      action: 'create', entityType: 'holiday', entityId: r.rows[0].id,
+      entityLabel: `${country} ${date} ${name || ''}`.trim(), country: String(country).toUpperCase(),
+    });
+    res.status(201).json(r.rows[0]);
+  } catch (error) {
+    console.error('Errore inserimento festivo:', error);
+    res.status(500).json({ message: 'Errore durante il salvataggio' });
+  }
+});
+
+// Inserimento in blocco: serve a caricare un anno intero in una volta
+app.post('/api/holidays/bulk', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  const { country, items } = req.body || {};
+  if (!country || !Array.isArray(items)) return res.status(400).json({ message: 'Dati non validi' });
+  const cc = String(country).toUpperCase();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let n = 0;
+    for (const it of items) {
+      if (!it.date) continue;
+      await client.query(
+        `INSERT INTO holidays (country, date, name) VALUES ($1,$2,$3)
+         ON CONFLICT (country, date) DO UPDATE SET name = $3`,
+        [cc, it.date, it.name || null]);
+      n++;
+    }
+    await client.query('COMMIT');
+    await logAudit(req, {
+      action: 'create', entityType: 'holiday', entityLabel: `${cc}: ${n} festivi`, country: cc,
+    });
+    res.json({ message: 'Festivi importati', count: n });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Errore importazione festivi:', error);
+    res.status(500).json({ message: 'Errore durante l\'importazione' });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/holidays/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
+  try {
+    const prev = (await pool.query('SELECT * FROM holidays WHERE id = $1', [req.params.id])).rows[0];
+    await pool.query('DELETE FROM holidays WHERE id = $1', [req.params.id]);
+    if (prev) await logAudit(req, {
+      action: 'delete', entityType: 'holiday', entityId: prev.id,
+      entityLabel: `${prev.country} ${prev.date}`, country: prev.country,
+    });
+    res.json({ message: 'Festivo rimosso' });
+  } catch (error) {
+    res.status(500).json({ message: 'Errore durante la rimozione' });
+  }
+});
+
+// Giorni non lavorativi di una nazione
+app.put('/api/country-weekend/:country', authenticateToken, authorize(['admin']), async (req, res) => {
+  const { days } = req.body || {};
+  if (!Array.isArray(days) || days.some(d => !Number.isInteger(d) || d < 0 || d > 6)) {
+    return res.status(400).json({ message: 'Giorni non validi' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO country_weekend (country, days) VALUES ($1,$2)
+       ON CONFLICT (country) DO UPDATE SET days = $2`,
+      [req.params.country.toUpperCase(), days]);
+    res.json({ message: 'Aggiornato' });
+  } catch (error) {
+    res.status(500).json({ message: 'Errore durante il salvataggio' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Licenza commerciale
+//
+// La verifica avviene in locale con una chiave pubblica: nessuna chiamata a
+// server esterni, funziona anche senza Internet e non trasmette nulla a
+// nessuno. Una licenza non puo' essere falsificata senza la chiave privata
+// dell'autore, ma il codice e' aperto: questo sistema documenta la conformita'
+// di chi e' in regola, non impedisce l'uso a chi non lo e'.
+//
+// Una licenza scaduta o assente NON limita alcuna funzione: l'applicazione
+// segnala soltanto che l'uso e' quello non commerciale.
+// ---------------------------------------------------------------------------
+const LICENSE_PUBLIC_KEY = require('./license-key.js');
+
+const verificaLicenza = (chiave) => {
+  try {
+    const parti = String(chiave || '').trim().split('.');
+    if (parti.length !== 3 || parti[0] !== 'PIO1') {
+      return { valid: false, error: 'Formato non riconosciuto' };
+    }
+    const payload = Buffer.from(parti[1], 'base64url');
+    const firma = Buffer.from(parti[2], 'base64url');
+    const ok = crypto.verify(null, payload, crypto.createPublicKey(LICENSE_PUBLIC_KEY), firma);
+    if (!ok) return { valid: false, error: 'Firma non valida' };
+
+    const d = JSON.parse(payload.toString());
+    const scaduta = Boolean(d.exp && new Date(d.exp) < new Date());
+    return {
+      valid: true,
+      expired: scaduta,
+      to: d.to,
+      email: d.email || null,
+      seats: d.seats || null,
+      notes: d.notes || null,
+      issued: d.iat,
+      expires: d.exp || null,
+      id: d.id,
+    };
+  } catch (e) {
+    return { valid: false, error: 'Licenza illeggibile' };
+  }
+};
+
+// Stato della licenza: visibile a chiunque sia autenticato, cosi' l'intestazione
+// puo' mostrare o nascondere l'indicazione d'uso non commerciale.
+app.get('/api/license', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT key, installed_at, installed_by FROM license WHERE id = 1');
+    if (!r.rows.length) return res.json({ licensed: false });
+    const v = verificaLicenza(r.rows[0].key);
+    if (!v.valid) return res.json({ licensed: false, error: v.error });
+    res.json({
+      licensed: true, ...v,
+      installed_at: r.rows[0].installed_at,
+      installed_by: r.rows[0].installed_by,
+    });
+  } catch (error) {
+    console.error('Errore lettura licenza:', error);
+    res.json({ licensed: false });
+  }
+});
+
+app.post('/api/license', authenticateToken, authorize(['admin']), async (req, res) => {
+  const { key } = req.body || {};
+  const v = verificaLicenza(key);
+  if (!v.valid) return res.status(400).json({ message: v.error || 'Licenza non valida' });
+
+  try {
+    await pool.query(
+      `INSERT INTO license (id, key, installed_by) VALUES (1, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET key = $1, installed_at = CURRENT_TIMESTAMP, installed_by = $2`,
+      [String(key).trim(), req.user.email]);
+    await logAudit(req, {
+      action: 'update', entityType: 'license', entityLabel: v.to,
+      details: { id: v.id, expires: v.expires || 'perpetua' },
+    });
+    res.json({ message: 'Licenza registrata', ...v });
+  } catch (error) {
+    console.error('Errore salvataggio licenza:', error);
+    res.status(500).json({ message: 'Errore durante il salvataggio' });
+  }
+});
+
+app.delete('/api/license', authenticateToken, authorize(['admin']), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM license WHERE id = 1');
+    await logAudit(req, { action: 'delete', entityType: 'license', entityLabel: 'licenza rimossa' });
+    res.json({ message: 'Licenza rimossa' });
+  } catch (error) {
+    res.status(500).json({ message: 'Errore durante la rimozione' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Posta elettronica (facoltativa)
 // Senza SMTP_HOST la funzione resta spenta e l'interfaccia non mostra il
@@ -1066,7 +1330,7 @@ app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
   }
   try {
     const acts = await pool.query(
-      `SELECT a.id, a.name, a.start_date, a.end_date, a.start_half, a.end_half, a.progress,
+      `SELECT a.id, a.name, a.start_date, a.end_date, a.start_half, a.end_half, a.day_part, a.progress,
               p.code AS project_code, p.name AS project_name, p.color AS project_color, p.country
        FROM activities a
        JOIN activity_technicians at ON at.activity_id = a.id
