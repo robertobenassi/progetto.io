@@ -13,3 +13,8 @@ docker-compose.override.yml
 *.sql
 *.tar.gz
 backup*/
+
+# Chiavi e strumenti delle licenze: solo dell'autore, mai nel repository
+license-private.pem
+licenze-emesse.log
+generate-license.js
