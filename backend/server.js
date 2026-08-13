@@ -365,6 +365,36 @@ const initDB = async () => {
     // Giorni non lavorativi per nazione. Non ovunque il fine settimana e'
     // sabato-domenica: in Arabia Saudita, Egitto e Qatar e' venerdi-sabato.
     // Numerazione JavaScript: 0 = domenica ... 6 = sabato.
+    // Nazioni abilitate: solo queste compaiono quando si crea un progetto.
+    // Chi lavora in due paesi non deve scorrere un elenco di centottantacinque.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS enabled_countries (
+        country CHAR(2) PRIMARY KEY,
+        enabled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        enabled_by VARCHAR(255)
+      );
+    `);
+
+    // Alla prima esecuzione si abilitano le nazioni gia' in uso: senza,
+    // un'installazione esistente si troverebbe l'elenco vuoto.
+    const giaAbilitate = await pool.query('SELECT COUNT(*)::int AS n FROM enabled_countries');
+    if (giaAbilitate.rows[0].n === 0) {
+      await pool.query(`
+        INSERT INTO enabled_countries (country, enabled_by)
+        SELECT DISTINCT country, 'migrazione' FROM projects WHERE country IS NOT NULL
+        UNION
+        SELECT DISTINCT country, 'migrazione' FROM user_countries WHERE country IS NOT NULL
+        UNION
+        SELECT DISTINCT home_country, 'migrazione' FROM technicians WHERE home_country IS NOT NULL
+        ON CONFLICT (country) DO NOTHING
+      `);
+      const n = await pool.query('SELECT COUNT(*)::int AS n FROM enabled_countries');
+      // Installazione nuova e senza dati: si parte dall'Italia, modificabile subito
+      if (n.rows[0].n === 0) {
+        await pool.query(`INSERT INTO enabled_countries (country, enabled_by) VALUES ('IT','predefinita')`);
+      }
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS country_weekend (
         country CHAR(2) PRIMARY KEY,
@@ -845,6 +875,91 @@ app.delete('/api/technicians/:id', authenticateToken, authorize(['admin']), asyn
 });
 
 // USERS
+// ---------------------------------------------------------------------------
+// Nazioni abilitate
+// ---------------------------------------------------------------------------
+app.get('/api/enabled-countries', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT country FROM enabled_countries ORDER BY country');
+    res.json(r.rows.map(x => x.country.trim()));
+  } catch (error) {
+    console.error('Errore lettura nazioni abilitate:', error);
+    res.status(500).json({ message: 'Errore durante il recupero' });
+  }
+});
+
+// Nazioni che non si possono disabilitare, con il motivo. Serve
+// all'interfaccia per mostrare il vincolo prima che l'utente ci provi.
+app.get('/api/enabled-countries/locked', authenticateToken, authorize(['admin']), async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT country, 'projects' AS reason, COUNT(*)::int AS n FROM projects
+        WHERE country IS NOT NULL GROUP BY country
+      UNION ALL
+      SELECT country, 'editors' AS reason, COUNT(*)::int AS n FROM user_countries
+        WHERE country IS NOT NULL GROUP BY country
+      UNION ALL
+      SELECT home_country AS country, 'technicians' AS reason, COUNT(*)::int AS n FROM technicians
+        WHERE home_country IS NOT NULL GROUP BY home_country
+    `);
+    const m = {};
+    r.rows.forEach(x => {
+      const cc = x.country.trim();
+      (m[cc] = m[cc] || {})[x.reason] = x.n;
+    });
+    res.json(m);
+  } catch (error) {
+    console.error('Errore lettura vincoli:', error);
+    res.status(500).json({ message: 'Errore durante il recupero' });
+  }
+});
+
+app.put('/api/enabled-countries', authenticateToken, authorize(['admin']), async (req, res) => {
+  const { countries } = req.body || {};
+  if (!Array.isArray(countries)) return res.status(400).json({ message: 'Dati non validi' });
+  const richieste = countries.map(x => String(x).toUpperCase().trim()).filter(x => /^[A-Z]{2}$/.test(x));
+
+  const client = await pool.connect();
+  try {
+    // Una nazione in uso non si puo' togliere: i progetti resterebbero
+    // orfani e gli editor perderebbero i permessi senza spiegazione.
+    const inUso = await client.query(`
+      SELECT DISTINCT country FROM projects WHERE country IS NOT NULL
+      UNION SELECT DISTINCT country FROM user_countries WHERE country IS NOT NULL
+      UNION SELECT DISTINCT home_country FROM technicians WHERE home_country IS NOT NULL
+    `);
+    const bloccate = inUso.rows.map(x => x.country.trim());
+    const mancanti = bloccate.filter(cc => !richieste.includes(cc));
+    if (mancanti.length) {
+      return res.status(400).json({
+        message: `Queste nazioni sono in uso e non possono essere disattivate: ${mancanti.join(', ')}`,
+        locked: mancanti,
+      });
+    }
+
+    await client.query('BEGIN');
+    await client.query('DELETE FROM enabled_countries');
+    for (const cc of richieste) {
+      await client.query(
+        'INSERT INTO enabled_countries (country, enabled_by) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+        [cc, req.user.email]);
+    }
+    await client.query('COMMIT');
+    await logAudit(req, {
+      action: 'update', entityType: 'countries',
+      entityLabel: `${richieste.length} nazioni abilitate`,
+      details: { countries: richieste },
+    });
+    res.json({ countries: richieste });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Errore salvataggio nazioni:', error);
+    res.status(500).json({ message: 'Errore durante il salvataggio' });
+  } finally {
+    client.release();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Festivi e giorni lavorativi
 // ---------------------------------------------------------------------------

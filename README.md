@@ -3,21 +3,30 @@
 Pianificazione di progetti e tecnici su più paesi, con diagramma di Gantt,
 rilevamento dei conflitti di assegnazione, report e app per i tecnici sul campo.
 
+Nato per il lavoro su impianti e cantieri, dove le squadre si spostano fra
+sedi e nazioni diverse e sapere chi è dove conta più di ogni altra cosa.
+
 ## Cosa fa
 
-- **Gantt** con vista per progetto o per tecnico, zoom settimana/mese e mezze giornate
-- **Conflitti** rilevati automaticamente: doppie assegnazioni e attività durante le assenze
-- **Multi-paese**: ogni progetto ha una nazione, gli editor lavorano solo sulle proprie aree
-- **Report**: agenda tecnico, carico, giorni uomo (svolti e previsti), trasferte, ritardi, assenze
+- **Gantt** con vista per progetto o per tecnico, zoom settimana/mese
+- **Mezze giornate**: un'attività può occupare solo le mattine o solo i pomeriggi
+- **Giorni lavorativi**: indicando una durata, la data di fine salta riposi e festivi
+- **Festivi per nazione**, calcolati automaticamente per 31 paesi o inseriti a mano
+- **Conflitti** rilevati da soli: doppie assegnazioni e attività durante le assenze
+- **Assenze** dei tecnici, anche a mezza giornata
+- **Multi-paese**: ogni progetto ha una nazione, gli editor lavorano solo sulle proprie
+- **Otto report** esportabili in CSV e stampabili in PDF
 - **App per i tecnici**: ognuno vede le proprie attività dal telefono, senza password
-- **Registro modifiche** e backup/ripristino del database
+- **Manutenzione**: backup, ripristino, registro modifiche, aggiornamenti
 - Interfaccia in italiano, inglese, francese, spagnolo, tedesco e portoghese
+- Tema chiaro e scuro
 
 ## Stack
 
 React · Node.js/Express · PostgreSQL 15 · Caddy · Docker
 
-Nessun servizio a pagamento, nessuna licenza commerciale nelle dipendenze.
+Nessun servizio a pagamento, nessuna chiamata a server esterni, nessuna
+telemetria. I dati restano sul server di chi installa.
 
 ---
 
@@ -61,9 +70,18 @@ Migrazioni del database e indici vengono applicati da soli all'avvio.
 ### 3. Primo accesso
 
 - Utente: `admin@progetto.io`
-- Password: `admin123`
+- Password: `admin123` (o quella impostata in `ADMIN_PASSWORD`)
 
 **Cambiare la password al primo accesso.**
+
+### 4. Configurazione iniziale
+
+1. **Manutenzione → Nazioni abilitate**: scegliere i paesi dove si lavora.
+   Solo questi compariranno creando un progetto.
+2. **Manutenzione → Festivi**: importare il calendario per ogni nazione e
+   aggiungere ponti e chiusure aziendali.
+3. **Tecnici**: inserire le persone.
+4. **Utenti**: creare gli account e assegnare le aree agli editor.
 
 ---
 
@@ -82,6 +100,9 @@ non tenta di ottenere certificati, quel compito resta al proxy davanti.
 ```caddyfile
 progetti.esempio.com {
     reverse_proxy localhost:8080
+    request_body {
+        max_size 60MB
+    }
 }
 ```
 
@@ -103,13 +124,12 @@ server {
 
 ### Proxy già in Docker
 
-Se il proxy gira in un container, si può evitare di pubblicare la porta e
-collegare direttamente le reti. Creare `docker-compose.override.yml`:
+Se il proxy gira in un container, `localhost` per lui è il container stesso.
+Conviene collegare le reti creando `docker-compose.override.yml`:
 
 ```yaml
 services:
   frontend:
-    ports: !reset []
     networks:
       - internal
       - proxy
@@ -127,9 +147,8 @@ Il frontend è in ascolto solo su localhost. È voluto: se ascoltasse su tutte
 le interfacce, l'applicazione sarebbe raggiungibile in HTTP sull'IP pubblico
 scavalcando il reverse proxy — e le credenziali viaggerebbero in chiaro.
 
-Il proxy gira sulla stessa macchina e vi accede senza problemi. Solo se si usa
-l'applicazione in rete locale **senza** alcun proxy va impostato
-`APP_BIND=0.0.0.0`.
+Solo se si usa l'applicazione in rete locale **senza** alcun proxy va
+impostato `APP_BIND=0.0.0.0`.
 
 ### Nota su HTTPS
 
@@ -152,20 +171,23 @@ attivano una volta e il dispositivo resta collegato.
 Il link in chiaro compare **una sola volta**: sul server ne resta solo
 l'impronta. Se va perso se ne genera un altro, e il precedente decade.
 
-Dalla stessa finestra si vedono i dispositivi attivi e si possono **revocare**:
-utile con un telefono smarrito o quando qualcuno lascia l'azienda.
-
+Dalla stessa finestra si vedono i dispositivi attivi e si possono **revocare**.
 I tecnici vedono soltanto le proprie attività, **in sola lettura**.
+
+L'app funziona anche senza rete, mostrando l'ultima agenda scaricata.
 
 ---
 
 ## Ruoli
 
-| Ruolo | Lettura | Scrittura |
-|---|---|---|
-| **admin** | tutto | tutto, più utenti, backup e ripristino |
-| **editor** | tutto | progetti e attività delle sole nazioni assegnate |
-| **viewer** | tutto | nulla |
+| | Admin | Editor | Viewer |
+|---|:---:|:---:|:---:|
+| Lettura di tutto | ✅ | ✅ | ✅ |
+| Progetti e attività | ovunque | proprie nazioni | ❌ |
+| Eliminare progetti | ✅ | ❌ | ❌ |
+| Tecnici, assenze, festivi | ✅ | ✅ | ❌ |
+| Utenti, nazioni, licenza | ✅ | ❌ | ❌ |
+| Backup e ripristino | ✅ | ❌ | ❌ |
 
 La lettura è sempre completa, per tutti: senza vedere tutti i progetti non si
 vedrebbero i conflitti dei tecnici in trasferta. Le nazioni di un editor si
@@ -193,6 +215,31 @@ Per una copia automatica notturna:
 0 2 * * * docker exec progetto_db pg_dump -U progetto_user progetto_db | gzip > /backup/progetto-$(date +\%F).sql.gz
 ```
 
+## Recupero dell'accesso
+
+Se è configurato un server SMTP, la pagina di accesso mostra "Password
+dimenticata". Altrimenti, da riga di comando sul server:
+
+```bash
+docker exec -it progetto_backend node reset-admin.js --list
+docker exec -it progetto_backend node reset-admin.js indirizzo@esempio.it
+```
+
+Stampa una password provvisoria da cambiare al primo accesso. Aggiungendo
+`--promote` la persona diventa amministratore, utile se l'unico admin ha
+lasciato l'azienda.
+
+---
+
+## Posta elettronica (facoltativa)
+
+Senza SMTP configurato il recupero password non compare e gli inviti ai
+tecnici si condividono copiando il link. Impostando le variabili `SMTP_*` nel
+file `.env` si abilitano entrambi.
+
+Serve un mittente su un dominio proprio, con SPF e DKIM configurati: un
+messaggio che finisce in spam è un utente bloccato fuori.
+
 ---
 
 ## Limiti noti
@@ -208,6 +255,9 @@ Verificato con 200 progetti, 150 tecnici e 2.000 attività.
 Il limite non è il database — che a questi numeri occupa pochi MB — ma il
 fatto che l'interfaccia carica l'intero insieme di dati in una volta.
 
+L'interfaccia principale è pensata per schermi da portatile in su. Sul telefono
+si usa la PWA dei tecnici.
+
 ---
 
 ## Aggiornamento
@@ -219,6 +269,8 @@ docker compose up -d --build
 
 Le migrazioni sono automatiche. Consigliato un backup prima di aggiornare.
 
+In **Manutenzione → Aggiornamenti** si vede se esiste una versione più recente.
+
 ---
 
 ## Documentazione
@@ -227,7 +279,6 @@ Le migrazioni sono automatiche. Consigliato un backup prima di aggiornare.
 |---|---|
 | [GUIDA.md](GUIDA.md) | Guida rapida all'uso — italiano e inglese |
 | [PRIVACY.md](PRIVACY.md) | Dati trattati e verifiche per chi installa |
-| [SPEC.md](SPEC.md) | Scelte tecniche e architettura |
 
 ## Autore
 
@@ -237,4 +288,6 @@ Le migrazioni sono automatiche. Consigliato un backup prima di aggiornare.
 
 Uso non commerciale: [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.it)
 
-Per l'uso commerciale contattare l'autore.
+Per l'uso commerciale contattare l'autore. La licenza si registra in
+**Manutenzione → Licenza** e viene verificata in locale, senza alcun contatto
+con server esterni.

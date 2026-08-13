@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { LANGUAGES, LOCALES, makeT } from './i18n';
 import Reports from './Reports';
+import { REGIONS, countryName } from './countries';
+import { computeHolidays, SUPPORTED as HOLIDAY_COUNTRIES } from './holidays';
 import {
   halfUnit, actStartUnit, actEndUnit, actDurationDays, dayPartOf,
-  addWorkingDays, countWorkingDays, calendarDays, toInputDate, activitiesOverlap,
+  addWorkingDays, countWorkingDays, calendarDays, toInputDate, activitiesOverlap, weekendDays,
 } from './dateUtils';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
 import axios from 'axios';
@@ -112,6 +114,9 @@ const App = () => {
   const [onlyConflicts, setOnlyConflicts] = useState(false);
   const [filterTechIds, setFilterTechIds] = useState([]);
   const [expandedConflictTechs, setExpandedConflictTechs] = useState([]);
+  const [showNonWorking, setShowNonWorking] = useState(() => {
+    try { return localStorage.getItem('showNonWorking') !== '0'; } catch { return true; }
+  });
   const [inverted, setInverted] = useState(() => {
     try { return localStorage.getItem('inverted') === '1'; } catch { return false; }
   });
@@ -142,9 +147,13 @@ const App = () => {
   // Il registro si popola entrando nella pagina: un pulsante "carica" accanto
   // a "ripristina backup" era ambiguo, sembrava riferirsi a un file.
   useEffect(() => {
-    if (currentView === 'system' && user?.role === 'admin') fetchAudit(0);
+    if (currentView === 'system' && user?.role === 'admin') { fetchAudit(0); fetchLockedCountries(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentView, user]);
+
+  useEffect(() => {
+    try { localStorage.setItem('showNonWorking', showNonWorking ? '1' : '0'); } catch {}
+  }, [showNonWorking]);
 
   useEffect(() => {
     try { localStorage.setItem('inverted', inverted ? '1' : '0'); } catch {}
@@ -207,6 +216,11 @@ const App = () => {
   const [formWorkDays, setFormWorkDays] = useState('');
   const [techSearch, setTechSearch] = useState('');
   const [holidays, setHolidays] = useState([]);
+  const [enabledCountries, setEnabledCountries] = useState([]);
+  const [lockedCountries, setLockedCountries] = useState({});
+  const [holidayCountry, setHolidayCountry] = useState('');
+  const [holidayYear, setHolidayYear] = useState(new Date().getFullYear());
+  const [newHoliday, setNewHoliday] = useState({ date: '', name: '' });
   const [weekendMap, setWeekendMap] = useState({});
   const [showUserModal, setShowUserModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
@@ -226,6 +240,7 @@ const App = () => {
       fetchAbsences();
       fetchLicense();
       fetchHolidays();
+      fetchEnabledCountries();
       fetchActivities();
       if (user.role === 'admin') {
         fetchUsers();
@@ -479,6 +494,65 @@ const App = () => {
       setDevices(res.data);
     } catch (error) {
       alert(error.response?.data?.message || 'Errore durante la revoca');
+    }
+  };
+
+  const importHolidays = async () => {
+    // Il calendario si calcola qui: nessuna chiamata a servizi esterni,
+    // quindi funziona anche su una macchina senza accesso a Internet.
+    const items = computeHolidays(holidayCountry, holidayYear);
+    if (!items.length) { alert(t('noCalendarFor')); return; }
+    if (!window.confirm(`${items.length} ${t('holidaysFound')} — ${holidayCountry} ${holidayYear}`)) return;
+    try {
+      const r = await axios.post(`${API_URL}/holidays/bulk`, { country: holidayCountry, items });
+      alert(`${r.data.count} ${t('holidaysImported')}`);
+      fetchHolidays();
+    } catch (err) {
+      alert(err.response?.data?.message || 'Errore durante l\'importazione');
+    }
+  };
+
+  const addHoliday = async () => {
+    if (!holidayCountry || !newHoliday.date) { alert(t('dateRequired')); return; }
+    try {
+      await axios.post(`${API_URL}/holidays`, {
+        country: holidayCountry, date: newHoliday.date, name: newHoliday.name || null,
+      });
+      setNewHoliday({ date: '', name: '' });
+      fetchHolidays();
+    } catch (err) {
+      alert(err.response?.data?.message || 'Errore');
+    }
+  };
+
+  const deleteHoliday = async (id) => {
+    try {
+      await axios.delete(`${API_URL}/holidays/${id}`);
+      fetchHolidays();
+    } catch { alert('Errore'); }
+  };
+
+  const fetchEnabledCountries = async () => {
+    try {
+      const r = await axios.get(`${API_URL}/enabled-countries`);
+      setEnabledCountries(r.data || []);
+    } catch { setEnabledCountries([]); }
+  };
+
+  const fetchLockedCountries = async () => {
+    try {
+      const r = await axios.get(`${API_URL}/enabled-countries/locked`);
+      setLockedCountries(r.data || {});
+    } catch { setLockedCountries({}); }
+  };
+
+  const saveEnabledCountries = async (lista) => {
+    try {
+      await axios.put(`${API_URL}/enabled-countries`, { countries: lista });
+      setEnabledCountries(lista);
+    } catch (err) {
+      alert(err.response?.data?.message || 'Errore durante il salvataggio');
+      fetchEnabledCountries();
     }
   };
 
@@ -1041,10 +1115,51 @@ const handleSaveActivity = async (activityData) => {
     const ROW_H  = 48;
     const gridW  = dates.length * DAY_W;
 
-    // Sfondo griglia disegnato in CSS: 1 nodo invece di N celle per riga
+    // Con una sola nazione filtrata l'ombreggiatura e' univoca. Con piu'
+    // nazioni i festivi non si evidenziano: un giorno rosso che vale solo
+    // per un paese si legge come "qui non si lavora" e induce in errore.
+    const nazioneUnica = filterCountries.length === 1 ? filterCountries[0] : null;
+    const riposi = nazioneUnica ? weekendDays(nazioneUnica, weekendMap) : [0, 6];
+
+    const festiviVisibili = nazioneUnica
+      ? holidays.filter(h => h.country.trim() === nazioneUnica)
+      : [];
+    const festivoDi = (d) => {
+      const s = toInputDate(d);
+      return festiviVisibili.find(h => toInputDate(h.date) === s) || null;
+    };
+
+    const isRiposo = (d) => riposi.includes(d.getDay());
+
+    // Sfondo griglia disegnato in CSS: 1 nodo invece di N celle per riga.
+    // Le colonne non lavorative si sovrappongono come secondo livello.
+    const colonneOmbreggiate = showNonWorking
+      ? dates.map((d, i) => {
+          const f = festivoDi(d);
+          if (f) return { i, tono: 'rgba(239,68,68,0.10)' };      // festivo
+          if (isRiposo(d)) return { i, tono: 'rgba(128,128,128,0.10)' };  // riposo
+          return null;
+        }).filter(Boolean)
+      : [];
+
     const gridBg = {
-      backgroundImage: `repeating-linear-gradient(to right, var(--border) 0 1px, transparent 1px ${DAY_W}px)`,
-      backgroundSize: `${DAY_W}px 100%`,
+      backgroundImage: [
+        ...colonneOmbreggiate.map(({ i, tono }) =>
+          `linear-gradient(to right, ${tono} 0 ${DAY_W}px)`),
+        `repeating-linear-gradient(to right, var(--border) 0 1px, transparent 1px ${DAY_W}px)`,
+      ].join(', '),
+      backgroundSize: [
+        ...colonneOmbreggiate.map(() => `${DAY_W}px 100%`),
+        `${DAY_W}px 100%`,
+      ].join(', '),
+      backgroundPosition: [
+        ...colonneOmbreggiate.map(({ i }) => `${i * DAY_W}px 0`),
+        '0 0',
+      ].join(', '),
+      backgroundRepeat: [
+        ...colonneOmbreggiate.map(() => 'no-repeat'),
+        'repeat',
+      ].join(', '),
     };
 
     // Posizione della barra dell'attivita' nel periodo visibile
@@ -1273,6 +1388,20 @@ const handleSaveActivity = async (activityData) => {
             {t('onlyConflicts')}
           </label>
 
+          {/* Giorni non lavorativi. Chi pianifica interventi proprio nei fermi
+              macchina puo' trovare l'ombreggiatura piu' di disturbo che di aiuto. */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}
+            title={filterCountries.length === 1
+              ? t('nonWorkingHintOne')
+              : t('nonWorkingHintMany')}>
+            <input type="checkbox" checked={showNonWorking}
+              onChange={(e) => setShowNonWorking(e.target.checked)} />
+            {t('showNonWorking')}
+            {showNonWorking && filterCountries.length !== 1 && (
+              <span style={{ fontSize: 11, color: 'var(--muted)' }}>({t('weekendsOnly')})</span>
+            )}
+          </label>
+
           {/* Espandi / chiudi tutto */}
           <button
             onClick={groupBy === 'project' ? toggleAllVisibleProjects : toggleAllVisibleTechs}
@@ -1346,20 +1475,39 @@ const handleSaveActivity = async (activityData) => {
               }}>
                 {groupBy === 'project' ? t('projectActivity') : t('technicianTasks')}
               </div>
-              {dates.map((date, i) => (
-                <div key={i} style={{
-                  width: DAY_W, minWidth: DAY_W,
-                  display: 'flex', flexDirection: 'column',
-                  alignItems: 'center', justifyContent: 'center',
-                  borderRight: '1px solid var(--border)',
-                  backgroundColor: isToday(date) ? 'var(--surface2)' : 'transparent',
-                }}>
-                  <div style={{ fontSize: viewMode === 'week' ? 13 : 11, fontWeight: 700 }}>{formatDate(date)}</div>
-                  <div style={{ fontSize: 10, color: 'var(--muted)' }}>
-                    {date.toLocaleDateString(locale, { weekday: 'short' })}
+              {dates.map((date, i) => {
+                const festa = showNonWorking ? festivoDi(date) : null;
+                const riposo = showNonWorking && isRiposo(date);
+                return (
+                  <div key={i}
+                    title={festa ? (festa.name || t('holidays')) : undefined}
+                    style={{
+                      width: DAY_W, minWidth: DAY_W,
+                      display: 'flex', flexDirection: 'column',
+                      alignItems: 'center', justifyContent: 'center',
+                      borderRight: '1px solid var(--border)',
+                      backgroundColor: isToday(date) ? 'var(--surface2)'
+                        : festa ? 'rgba(239,68,68,0.10)'
+                        : riposo ? 'rgba(128,128,128,0.10)'
+                        : 'transparent',
+                    }}>
+                    <div style={{
+                      fontSize: viewMode === 'week' ? 13 : 11, fontWeight: 700,
+                      color: festa ? '#ef4444' : riposo ? 'var(--muted)' : 'var(--fg)',
+                    }}>{formatDate(date)}</div>
+                    <div style={{
+                      fontSize: 10,
+                      color: festa ? '#ef4444' : 'var(--muted)',
+                      overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: DAY_W - 4,
+                      textOverflow: 'ellipsis', textAlign: 'center',
+                    }}>
+                      {festa && viewMode === 'week'
+                        ? (festa.name || '•')
+                        : date.toLocaleDateString(locale, { weekday: 'short' })}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* ===== VISTA PER PROGETTO ===== */}
@@ -2910,13 +3058,24 @@ const handleSaveActivity = async (activityData) => {
                     backgroundColor: 'var(--surface)'
                   }}
                 >
-                  {EMEA_COUNTRIES.map(g => (
-                    <optgroup key={g.group} label={g.group}>
-                      {g.items.map(([code, name]) => (
-                        <option key={code} value={code} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>{countryFlag(code)} {name}</option>
-                      ))}
-                    </optgroup>
-                  ))}
+                  {/* Solo le nazioni abilitate in Manutenzione: chi lavora in
+                      due paesi non deve scorrerne centottantacinque. */}
+                  {REGIONS.map(r => {
+                    const attive = r.codes.filter(cc => enabledCountries.includes(cc));
+                    if (!attive.length) return null;
+                    return (
+                      <optgroup key={r.id} label={t('region_' + r.id)}>
+                        {attive
+                          .map(cc => [cc, countryName(cc, locale)])
+                          .sort((a, b) => a[1].localeCompare(b[1]))
+                          .map(([cc, nome]) => (
+                            <option key={cc} value={cc} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>
+                              {countryFlag(cc)} {nome}
+                            </option>
+                          ))}
+                      </optgroup>
+                    );
+                  })}
                 </select>
               </div>
               <div style={{ marginBottom: '1rem' }}>
@@ -3705,12 +3864,271 @@ const handleSaveActivity = async (activityData) => {
             </div>
           </div>
 
-          <div style={{
+          {/* Festivi */}
+          <details style={{
             backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
             borderRadius: 8, padding: '1rem', marginTop: '1rem',
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
-              <h3 style={{ margin: 0, fontSize: '1rem' }}>📝 {t('changeLog')}</h3>
+            <summary style={{ cursor: 'pointer', fontWeight: 700, fontSize: '1rem', userSelect: 'none' }}>
+              📅 {t('holidays')}
+              <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 10, fontSize: 13 }}>
+                {holidays.length}
+              </span>
+            </summary>
+
+            {/* Riepilogo: quali nazioni hanno i festivi e quali no. Senza,
+                bisognerebbe selezionarle una per una per accorgersi che ne
+                manca una — e il calcolo dei giorni lavorativi sbaglierebbe
+                senza segnalarlo. */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
+              {enabledCountries
+                .map(cc => {
+                  const n = holidays.filter(h =>
+                    h.country.trim() === cc &&
+                    new Date(h.date).getFullYear() === holidayYear).length;
+                  return { cc, n, nome: countryName(cc, locale) };
+                })
+                .sort((a, b) => a.n - b.n || a.nome.localeCompare(b.nome))
+                .map(({ cc, n, nome }) => (
+                  <button key={cc}
+                    onClick={() => setHolidayCountry(cc)}
+                    title={n === 0 ? t('noHolidaysForYear') : `${n} ${t('holidays').toLowerCase()}`}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      padding: '3px 9px', borderRadius: 20, fontSize: 12, cursor: 'pointer',
+                      border: holidayCountry === cc ? '2px solid var(--accent)' : '1px solid var(--border)',
+                      backgroundColor: 'var(--surface)',
+                      color: n === 0 ? '#f59e0b' : 'var(--fg)',
+                    }}>
+                    {countryFlag(cc)} {cc}
+                    <strong style={{ fontSize: 11 }}>{n === 0 ? '⚠' : n}</strong>
+                  </button>
+                ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', margin: '12px 0' }}>
+              <select value={holidayCountry} onChange={(e) => setHolidayCountry(e.target.value)}
+                style={{
+                  padding: '6px 10px', fontSize: 13, borderRadius: 5,
+                  border: '1px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                }}>
+                <option value="" style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>
+                  {t('selectCountry')}
+                </option>
+                {enabledCountries
+                  .map(cc => [cc, countryName(cc, locale)])
+                  .sort((a, b) => a[1].localeCompare(b[1]))
+                  .map(([cc, nome]) => (
+                    <option key={cc} value={cc} style={{ color: 'var(--fg)', backgroundColor: 'var(--surface)' }}>
+                      {countryFlag(cc)} {nome}
+                    </option>
+                  ))}
+              </select>
+
+              <input type="number" value={holidayYear} min="2020" max="2099"
+                onChange={(e) => setHolidayYear(parseInt(e.target.value) || new Date().getFullYear())}
+                style={{
+                  width: 90, padding: '6px 10px', fontSize: 13, borderRadius: 5,
+                  border: '1px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                }} />
+
+              <button onClick={importHolidays}
+                disabled={!holidayCountry || !HOLIDAY_COUNTRIES.includes(holidayCountry)}
+                title={holidayCountry && !HOLIDAY_COUNTRIES.includes(holidayCountry) ? t('noCalendarFor') : ''}
+                style={{
+                  padding: '6px 14px', fontSize: 13, borderRadius: 5, border: 'none', fontWeight: 600,
+                  backgroundColor: (holidayCountry && HOLIDAY_COUNTRIES.includes(holidayCountry))
+                    ? 'var(--accent)' : 'var(--border)',
+                  color: 'var(--accentFg)',
+                  cursor: (holidayCountry && HOLIDAY_COUNTRIES.includes(holidayCountry)) ? 'pointer' : 'not-allowed',
+                }}>
+                ⬇ {t('importCalendar')}
+              </button>
+
+              {holidayCountry && !HOLIDAY_COUNTRIES.includes(holidayCountry) && (
+                <span style={{ fontSize: 12, color: '#f59e0b' }}>⚠ {t('noCalendarFor')}</span>
+              )}
+            </div>
+
+            {/* Inserimento manuale: chiusure aziendali, ponti, feste locali */}
+            {holidayCountry && (
+              <div style={{
+                display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center',
+                padding: '8px 10px', marginBottom: 12,
+                backgroundColor: 'var(--surface2)', borderRadius: 6,
+              }}>
+                <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('addHoliday')}:</span>
+                <input type="date" value={newHoliday.date}
+                  onChange={(e) => setNewHoliday({ ...newHoliday, date: e.target.value })}
+                  style={{
+                    padding: '5px 8px', fontSize: 13, borderRadius: 5,
+                    border: '1px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }} />
+                <input type="text" value={newHoliday.name} placeholder={t('holidayName')}
+                  onChange={(e) => setNewHoliday({ ...newHoliday, name: e.target.value })}
+                  style={{
+                    flex: 1, minWidth: 160, padding: '5px 8px', fontSize: 13, borderRadius: 5,
+                    border: '1px solid var(--border)', backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }} />
+                <button onClick={addHoliday}
+                  style={{
+                    padding: '5px 12px', fontSize: 13, borderRadius: 5,
+                    border: '1px solid var(--border)', background: 'transparent',
+                    color: 'var(--fg)', cursor: 'pointer',
+                  }}>+</button>
+              </div>
+            )}
+
+            {/* Elenco */}
+            {(() => {
+              const elenco = holidays
+                .filter(h => !holidayCountry || h.country.trim() === holidayCountry)
+                .filter(h => new Date(h.date).getFullYear() === holidayYear)
+                .sort((a, b) => new Date(a.date) - new Date(b.date));
+              if (!elenco.length) {
+                return <div style={{ fontSize: 13, color: 'var(--muted)', padding: '8px 0' }}>
+                  {t('noHolidays')}
+                </div>;
+              }
+              return (
+                <div style={{
+                  maxHeight: 260, overflowY: 'auto',
+                  border: '1px solid var(--border)', borderRadius: 6,
+                }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <tbody>
+                      {elenco.map(h => (
+                        <tr key={h.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                          <td style={{ padding: '5px 10px', whiteSpace: 'nowrap', width: 40 }}>
+                            {countryFlag(h.country.trim())}
+                          </td>
+                          <td style={{ padding: '5px 10px', whiteSpace: 'nowrap' }}>
+                            {new Date(h.date).toLocaleDateString(locale, { weekday: 'short', day: 'numeric', month: 'short' })}
+                          </td>
+                          <td style={{ padding: '5px 10px' }}>{h.name || '—'}</td>
+                          <td style={{ padding: '5px 10px', textAlign: 'right' }}>
+                            <button onClick={() => deleteHoliday(h.id)}
+                              style={{
+                                background: 'transparent', border: '1px solid var(--border)',
+                                borderRadius: 4, color: '#ef4444', cursor: 'pointer', padding: '1px 7px',
+                              }}>×</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
+          </details>
+
+          {/* Nazioni abilitate — richiudibile: con 185 nazioni la sezione
+              occuperebbe mezza pagina anche quando non serve. */}
+          <details style={{
+            backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 8, padding: '1rem', marginBottom: '1rem',
+          }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 700, fontSize: '1rem', userSelect: 'none' }}>
+              🌍 {t('enabledCountries')}
+              <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 10, fontSize: 13 }}>
+                {enabledCountries.length} {t('activeCount')}
+              </span>
+            </summary>
+            <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 10, marginBottom: 10 }}>
+              {t('enabledCountriesHint')}
+            </p>
+
+            <div style={{
+              border: '1px solid var(--border)', borderRadius: 6,
+              maxHeight: 380, overflowY: 'auto', padding: '0.6rem',
+              backgroundColor: 'var(--surface2)',
+            }}>
+              {REGIONS.map(r => {
+                const attiveQui = r.codes.filter(cc => enabledCountries.includes(cc));
+                const tutteAttive = attiveQui.length === r.codes.length;
+                return (
+                  <div key={r.id} style={{ marginBottom: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 5 }}>
+                      <strong style={{ fontSize: 12 }}>{t('region_' + r.id)}</strong>
+                      <span style={{ fontSize: 11, color: 'var(--muted)' }}>
+                        {attiveQui.length}/{r.codes.length}
+                      </span>
+                      <button
+                        onClick={() => {
+                          // Un clic per l'area intera: chi lavora in tutta
+                          // Europa non deve spuntare ventiquattro caselle.
+                          const nuove = tutteAttive
+                            ? enabledCountries.filter(cc => !r.codes.includes(cc)
+                                || lockedCountries[cc])   // le bloccate restano
+                            : [...new Set([...enabledCountries, ...r.codes])];
+                          saveEnabledCountries(nuove);
+                        }}
+                        style={{
+                          padding: '2px 9px', fontSize: 11, cursor: 'pointer', borderRadius: 4,
+                          border: '1px solid var(--border)', background: 'transparent', color: 'var(--fg)',
+                        }}>
+                        {tutteAttive ? t('deselectAll') : t('selectAll')}
+                      </button>
+                    </div>
+
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                      {r.codes
+                        .map(cc => [cc, countryName(cc, locale)])
+                        .sort((a, b) => a[1].localeCompare(b[1]))
+                        .map(([cc, nome]) => {
+                          const on = enabledCountries.includes(cc);
+                          const bloccata = Boolean(lockedCountries[cc]);
+                          const motivi = lockedCountries[cc] || {};
+                          const perche = [
+                            motivi.projects && `${motivi.projects} ${t('projectsCol').toLowerCase()}`,
+                            motivi.editors && `${motivi.editors} editor`,
+                            motivi.technicians && `${motivi.technicians} ${t('techniciansCol').toLowerCase()}`,
+                          ].filter(Boolean).join(', ');
+                          return (
+                            <button key={cc}
+                              onClick={() => {
+                                if (on && bloccata) { alert(`${nome}: ${t('countryInUse')} (${perche})`); return; }
+                                saveEnabledCountries(on
+                                  ? enabledCountries.filter(x => x !== cc)
+                                  : [...enabledCountries, cc]);
+                              }}
+                              title={bloccata ? `${t('countryInUse')}: ${perche}` : nome}
+                              style={{
+                                padding: '3px 9px', borderRadius: 20, fontSize: 12,
+                                cursor: (on && bloccata) ? 'not-allowed' : 'pointer',
+                                border: on ? '1px solid var(--accent)' : '1px solid var(--border)',
+                                backgroundColor: on ? 'var(--accent)' : 'var(--surface)',
+                                color: on ? 'var(--accentFg)' : 'var(--fg)',
+                                opacity: on ? 1 : 0.75,
+                              }}>
+                              {countryFlag(cc)} {nome}{on && bloccata ? ' 🔒' : ''}
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>
+              🔒 {t('lockedHint')}
+            </div>
+          </details>
+
+          <details style={{
+            backgroundColor: 'var(--surface)', border: '1px solid var(--border)',
+            borderRadius: 8, padding: '1rem', marginTop: '1rem',
+          }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 700, fontSize: '1rem', userSelect: 'none' }}>
+              📝 {t('changeLog')}
+              {auditTotal > 0 && (
+                <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 10, fontSize: 13 }}>
+                  {auditTotal}
+                </span>
+              )}
+            </summary>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '10px 0' }}>
               <button onClick={() => fetchAudit(auditPage)}
                 title={t('refresh')}
                 style={{
@@ -3792,7 +4210,7 @@ const handleSaveActivity = async (activityData) => {
                 </div>
               </>
             )}
-          </div>
+          </details>
         </div>
       )}
 
@@ -4220,15 +4638,17 @@ const handleSaveActivity = async (activityData) => {
                     border: '1px solid var(--border)', borderRadius: 5, padding: '0.6rem',
                     maxHeight: 240, overflowY: 'auto', backgroundColor: 'var(--surface2)',
                   }}>
-                    {EMEA_COUNTRIES.map(g => {
-                      // Tutte le nazioni EMEA, non solo quelle con progetti esistenti:
-                      // serve poter assegnare un'area prima che ci lavori qualcuno.
-                      // Un puntino segnala dove ci sono gia' progetti.
+                    {/* Solo le nazioni abilitate: assegnare a un editor un'area
+                        in cui l'azienda non lavora non avrebbe senso. */}
+                    {REGIONS.map(g => {
+                      const attive = g.codes.filter(cc => enabledCountries.includes(cc));
+                      if (!attive.length) return null;
                       return (
-                        <div key={g.group} style={{ marginBottom: 8 }}>
-                          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>{g.group}</div>
+                        <div key={g.id} style={{ marginBottom: 8 }}>
+                          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>{t('region_' + g.id)}</div>
                           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                            {g.items.map(([cc, label]) => {
+                            {attive.map(cc => {
+                              const label = countryName(cc, locale);
                               const sel = (editingUser ? (editingUser.countries || []) : newUser.countries).includes(cc);
                               return (
                                 <button key={cc} type="button"
