@@ -277,6 +277,7 @@ In **Manutenzione → Aggiornamenti** si vede se esiste una versione più recent
 
 | Documento | Contenuto |
 |---|---|
+| [MANUALE.md](MANUALE.md) | Manuale completo — italiano e inglese |
 | [GUIDA.md](GUIDA.md) | Guida rapida all'uso — italiano e inglese |
 | [PRIVACY.md](PRIVACY.md) | Dati trattati e verifiche per chi installa |
 
