@@ -1,0 +1,20 @@
+.env
+node_modules/
+frontend/build/
+*.log
+*.sql.backup
+caddy/data/
+caddy/config/
+
+# Configurazione specifica dell'installazione
+docker-compose.override.yml
+
+# Backup e dump
+*.sql
+*.tar.gz
+backup*/
+
+# Chiavi e strumenti delle licenze: solo dell'autore, mai nel repository
+license-private.pem
+licenze-emesse.log
+generate-license.js

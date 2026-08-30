@@ -1,0 +1,124 @@
+services:
+  # === DATABASE ===
+  postgres:
+    image: postgres@sha256:6bd113a3de3274beda0f056ebf0d75cf060dc4a493b72bea6f9d810dce63f897
+    container_name: progetto_db
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # === BACKEND ===
+  # Non espone porte: ci si arriva solo passando dal frontend.
+  backend:
+    build: ./backend
+    container_name: progetto_backend
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: 5000
+      # Amministratore iniziale: usato solo alla prima esecuzione
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Indirizzo pubblico, per i link inviati per email
+      APP_URL: ${APP_URL:-}
+      # Numero di reverse proxy davanti all'applicazione
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      # Origini ammesse per le chiamate dal browser
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Posta elettronica (facoltativa)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      # internal: per raggiungere il database, che resta isolato
+      - internal
+      # web: serve l'uscita verso Internet per inviare le email. Senza, il
+      # container non risolve nemmeno i nomi e l'SMTP fallisce con EAI_AGAIN.
+      # Non comporta alcuna esposizione: nessuna porta viene pubblicata.
+      - web
+
+  # === FRONTEND ===
+  # Unico punto d'ingresso: serve l'applicazione, la PWA dei tecnici e
+  # inoltra /api al backend. Basta puntarci il proprio reverse proxy.
+  frontend:
+    build: ./frontend
+    container_name: progetto_frontend
+    # In ascolto solo su localhost: il traffico deve passare dal reverse proxy,
+    # altrimenti l'applicazione resterebbe raggiungibile in chiaro sull'IP
+    # pubblico, scavalcando HTTPS. Per esporla su tutte le interfacce (rete
+    # locale fidata, nessun proxy) impostare APP_BIND=0.0.0.0 nel file .env.
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - internal
+      - web
+
+  # === CADDY (facoltativo) ===
+  # Si avvia solo con:  docker compose --profile standalone up -d
+  #
+  # Serve a chi non ha gia' un reverse proxy: ottiene HTTPS automatico con
+  # certificato gratuito, senza configurare nulla oltre al dominio nel .env.
+  #
+  # Chi ha gia' nginx, Traefik o un altro Caddy NON deve attivarlo: userebbe
+  # le stesse porte 80 e 443 e andrebbe in conflitto. In quel caso si avvia
+  # con il comando normale e si punta il proprio proxy alla porta APP_PORT.
+  caddy:
+    image: caddy:2-alpine
+    container_name: progetto_caddy
+    profiles: ["standalone"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile.standalone:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+    restart: unless-stopped
+    networks:
+      - internal
+      - web
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  # internal: isolata, senza accesso a Internet. Database e backend vivono qui.
+  internal:
+    internal: true
+  # web: serve al frontend per pubblicare la porta. Una rete "internal" non
+  # permette il port mapping, quindi il frontend deve stare su entrambe.
+  web:
+    driver: bridge

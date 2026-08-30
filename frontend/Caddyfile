@@ -1,0 +1,79 @@
+# Configurazione del container frontend.
+# Non gestisce certificati: l'HTTPS resta compito del reverse proxy davanti.
+# Qui si serve l'applicazione compilata e si inoltra /api al backend.
+{
+	# Niente HTTPS automatico: questo container ascolta solo in HTTP,
+	# dietro al proxy. Senza questa riga Caddy tenterebbe di ottenere
+	# certificati che non gli servono.
+	auto_https off
+	admin off
+}
+
+:80 {
+	encode gzip
+
+	# Intestazioni di sicurezza. Valgono per tutte le risposte: le imposta il
+	# frontend e non il proxy esterno, cosi' restano anche cambiando proxy.
+	header {
+		# Impedisce di caricare l'applicazione dentro un iframe altrui
+		X-Frame-Options "DENY"
+		# Il browser non deve indovinare il tipo di contenuto
+		X-Content-Type-Options "nosniff"
+		# Non rivelare l'indirizzo interno navigando verso siti esterni
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Funzioni del dispositivo che l'applicazione non usa
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+		# Limita le sorgenti di script e connessioni. 'unsafe-inline' e'
+		# necessario per gli stili in linea di React e per la PWA.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.github.com; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		# Nasconde la tecnologia usata
+		-Server
+	}
+
+	# API verso il backend. Il percorso viene inoltrato intero,
+	# perche' il backend espone gia' le rotte sotto /api.
+	handle /api/* {
+		# Caddy propaga da se' la catena degli indirizzi, accodando il
+		# mittente a X-Forwarded-For. Il backend la usa per riconoscere chi
+		# si collega, e da quella dipende il limite ai tentativi di accesso.
+		reverse_proxy backend:5000
+	}
+
+	# Il service worker non deve essere messo in cache dal browser:
+	# altrimenti un aggiornamento dell'app non arriverebbe mai ai telefoni.
+	handle /technician/sw.js {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		root * /srv
+		file_server
+	}
+
+	# PWA dei tecnici
+	handle /technician/* {
+		root * /srv
+		try_files {path} {path}/index.html /technician/index.html
+		file_server
+	}
+
+	# File con impronta nel nome: possono restare in cache a lungo
+	handle /static/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		root * /srv
+		file_server
+	}
+
+	# Applicazione principale.
+	# index.html non va mai messo in cache: contiene i riferimenti ai file
+	# compilati, e una copia vecchia continuerebbe a puntare al bundle
+	# precedente rendendo invisibili gli aggiornamenti.
+	handle {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+
+	# Il ripristino del database invia l'intero archivio in una sola richiesta
+	request_body {
+		max_size 60MB
+	}
+}

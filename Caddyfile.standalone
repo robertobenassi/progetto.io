@@ -1,0 +1,27 @@
+# Reverse proxy per l'installazione autonoma.
+#
+# Usato solo avviando con:  docker compose --profile standalone up -d
+# Chi ha gia' un proprio proxy non usa questo file.
+#
+# Il dominio e l'indirizzo email si impostano nel file .env:
+#   DOMAIN=progetti.esempio.com
+#   ACME_EMAIL=tuo.indirizzo@esempio.com
+#
+# Il certificato HTTPS viene richiesto e rinnovato da solo. Perche' funzioni,
+# il dominio deve puntare all'indirizzo IP di questo server e le porte 80 e
+# 443 devono essere raggiungibili da Internet.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	reverse_proxy progetto_frontend:80
+
+	# Il ripristino di un backup invia l'intero archivio in una sola richiesta
+	request_body {
+		max_size 60MB
+	}
+
+	encode zstd gzip
+}
