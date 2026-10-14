@@ -1,12 +1,20 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { LANGUAGES, LOCALES, makeT } from './i18n';
 import Reports from './Reports';
 import { REGIONS, countryName } from './countries';
 import { computeHolidays, SUPPORTED as HOLIDAY_COUNTRIES } from './holidays';
 import {
-  halfUnit, actStartUnit, actEndUnit, actDurationDays, dayPartOf,
-  addWorkingDays, countWorkingDays, calendarDays, toInputDate, activitiesOverlap, weekendDays,
+  actStartUnit, actDurationDays, dayPartOf,
+  addWorkingDays, countWorkingDays, calendarDays, toInputDate, weekendDays,
+  isoDay, formatActivityPeriod, fmtDays, isNonWorking,
 } from './dateUtils';
+// Calcoli per periodo di assegnazione: un tecnico puo' lavorare solo su una
+// parte di un'attivita', anche in piu' periodi separati
+import {
+  assignmentKey, assignmentsByTech, findConflicts, conflictMarks,
+  findAbsenceConflicts, occupiedDays, shiftPeriods, toAssignments,
+} from './planning.js';
+import AssignmentGrid from './AssignmentGrid.js';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
 import axios from 'axios';
 
@@ -240,6 +248,10 @@ const App = () => {
   const [formEnd, setFormEnd] = useState('');
   const [formDayPart, setFormDayPart] = useState('FULL');
   const [formWorkDays, setFormWorkDays] = useState('');
+  // Periodi di ogni tecnico nella finestra dell'attivita': { id: [periodi] }.
+  // Un tecnico senza voce lavora per tutta la durata.
+  const [formPeriods, setFormPeriods] = useState({});
+  const [formRequired, setFormRequired] = useState('');
   const [techSearch, setTechSearch] = useState('');
   const [techListSearch, setTechListSearch] = useState('');
   const [userSearch, setUserSearch] = useState('');
@@ -766,11 +778,12 @@ const App = () => {
 
 const handleSaveActivity = async (activityData) => {
   try {
-    // Assicurati che technician_ids sia un array
-    const dataToSend = {
+    // I tecnici viaggiano come periodi (assignments). Il vecchio formato,
+    // un semplice elenco di id, resta accettato per chi lo usa ancora.
+    const dataToSend = Array.isArray(activityData.assignments) ? { ...activityData } : {
       ...activityData,
-      technician_ids: Array.isArray(activityData.technician_ids) 
-        ? activityData.technician_ids 
+      technician_ids: Array.isArray(activityData.technician_ids)
+        ? activityData.technician_ids
         : activityData.technician_ids ? [activityData.technician_ids] : []
     };
     
@@ -900,64 +913,18 @@ const handleSaveActivity = async (activityData) => {
     }
   };
   
-  // Un conflitto = un PERIODO di sovrapposizione per tecnico, con tutte le attivita'
-  // coinvolte. La versione precedente creava una scheda per ogni singolo giorno,
-  // producendo migliaia di righe quasi identiche.
-  const detectedConflicts = useMemo(() => {
-    const conflicts = [];
-    const byTech = new Map();
+  // Un conflitto = un PERIODO di sovrapposizione per tecnico, con tutte le
+  // assegnazioni coinvolte. Si ragiona sul periodo di ogni tecnico, non
+  // sull'attivita' intera: chi lavora solo la prima settimana non e' in
+  // conflitto con un impegno della seconda. Il calcolo sta in planning.js.
+  // Gli elementi di activities sono viste di assegnazione: per aprire
+  // l'attivita' si usa .activity, mai la vista.
+  const detectedConflicts = useMemo(() => findConflicts(activities), [activities]);
 
-    activities.forEach(a => {
-      (a.technicians || []).forEach(t => {
-        if (!byTech.has(t.id)) byTech.set(t.id, { name: t.name, list: [] });
-        byTech.get(t.id).list.push(a);
-      });
-    });
 
-    byTech.forEach((entry, techId) => {
-      const sorted = [...entry.list].sort((x, y) => new Date(x.start_date) - new Date(y.start_date));
-      if (sorted.length < 2) return;
-
-      // Solo le attivita' realmente in conflitto entrano nei gruppi
-      const inConflitto = sorted.filter(a =>
-        sorted.some(b => b !== a && activitiesOverlap(a, b)));
-      if (inConflitto.length < 2) return;
-
-      let cluster = [inConflitto[0]];
-      let maxEnd = new Date(inConflitto[0].end_date);
-
-      const flush = () => {
-        if (cluster.length < 2) return;
-        const starts = cluster.map(a => new Date(a.start_date));
-        const ends = cluster.map(a => new Date(a.end_date));
-        conflicts.push({
-          technicianId: techId,
-          technicianName: entry.name,
-          startDate: new Date(Math.max(...starts)).toISOString().split('T')[0],
-          endDate: new Date(Math.min(...ends)).toISOString().split('T')[0],
-          periodStart: new Date(Math.min(...starts)).toISOString().split('T')[0],
-          periodEnd: new Date(Math.max(...ends)).toISOString().split('T')[0],
-          activities: cluster,
-        });
-      };
-
-      for (let i = 1; i < inConflitto.length; i++) {
-        const cur = inConflitto[i];
-        if (new Date(cur.start_date) <= maxEnd) {
-          cluster.push(cur);
-          if (new Date(cur.end_date) > maxEnd) maxEnd = new Date(cur.end_date);
-        } else {
-          flush();
-          cluster = [cur];
-          maxEnd = new Date(cur.end_date);
-        }
-      }
-      flush();
-    });
-
-    return conflicts;
-  }, [activities]);
-
+  // Numero con il sostantivo al singolare o al plurale: "1 periodo", "2 periodi"
+  const conta = (n, chiaveSingolare, chiavePlurale) =>
+    `${n} ${t(n === 1 ? chiaveSingolare : chiavePlurale)}`;
 
   const formatDate = (date) => {
     return date.toLocaleDateString(locale, { day: '2-digit', month: '2-digit' });
@@ -1002,13 +969,24 @@ const handleSaveActivity = async (activityData) => {
   const handleStartChange = (value) => {
     if (!value) { setFormStart(value); return; }
     setFormStart(value);
+    // Quando la fine segue l'inizio, l'attivita' si sposta: i periodi dei
+    // tecnici si spostano con lei, cosi' Marco resta "la prima settimana".
+    // Le date vuote seguono gia' l'attivita' e non cambiano.
+    const sposta = () => {
+      if (!formStart || !value) return;
+      const delta = daysBetween(formStart, value);
+      if (!delta) return;
+      setFormPeriods(prev => Object.fromEntries(
+        Object.entries(prev).map(([id, periodi]) => [id, shiftPeriods(periodi, delta)])));
+    };
     // Se e' stata indicata una durata, la fine si ricalcola sui giorni
     // lavorativi della nazione del progetto.
     if (formWorkDays) {
       setFormEnd(addWorkingDays(value, formWorkDays, formCountry, holidays, weekendMap));
+      sposta();
     } else if (formStart && formEnd) {
       const dur = daysBetween(formStart, formEnd);
-      if (dur >= 0) setFormEnd(addDays(value, dur));
+      if (dur >= 0) { setFormEnd(addDays(value, dur)); sposta(); }
     } else if (!formEnd) {
       setFormEnd(value);
     }
@@ -1039,6 +1017,23 @@ const handleSaveActivity = async (activityData) => {
   const includeNonLavorativi = Boolean(giorniCalendario && giorniLavorativi !== null
     && giorniLavorativi < giorniCalendario);
 
+  // Giorni uomo pianificati nella finestra, tecnico per tecnico, dai giorni
+  // accesi nella griglia: ogni giorno vale 1, o 0,5 per le attivita' di sole
+  // mattine o soli pomeriggi. Si contano i giorni di calendario, come nel
+  // report Giorni uomo, cosi' i due numeri coincidono.
+  const giorniUomoForm = useMemo(() => {
+    if (!formStart || !formEnd || dateError) return [];
+    const peso = formDayPart === 'FULL' ? 1 : 0.5;
+    const perTecnico = new Map();
+    toAssignments(selectedTechnicians, formPeriods, formStart, formEnd).forEach(p => {
+      const da = p.start_date || formStart;
+      const a = p.end_date || formEnd;
+      const giorni = daysBetween(da, a) + 1;
+      perTecnico.set(p.technician_id, (perTecnico.get(p.technician_id) || 0) + giorni * peso);
+    });
+    return [...perTecnico.entries()];
+  }, [formStart, formEnd, dateError, formDayPart, selectedTechnicians, formPeriods]);
+
   useEffect(() => {
     if (showActivityModal || showEditModal) {
       setFormStart(editingActivity?.start_date ? formatDateForInput(editingActivity.start_date) : '');
@@ -1046,28 +1041,32 @@ const handleSaveActivity = async (activityData) => {
       setFormDayPart(editingActivity ? dayPartOf(editingActivity) : 'FULL');
       setFormWorkDays('');
       setTechSearch('');
+      // Periodi salvati, raggruppati per tecnico. Senza l'elenco dei periodi
+      // (server precedente o attivita' nuova) ognuno vale per tutta la durata.
+      const periodi = {};
+      (editingActivity?.assignments || []).forEach(p => {
+        (periodi[p.technician_id] = periodi[p.technician_id] || [])
+          .push({ start_date: p.start_date, end_date: p.end_date });
+      });
+      setFormPeriods(periodi);
+      setFormRequired(editingActivity?.required_technicians ?? '');
     }
   }, [showActivityModal, showEditModal, editingActivity]);
 
-  const isDateInRange = (date, startDate, endDate) => {
-    const d = new Date(date);
-    d.setHours(0, 0, 0, 0);
-    const start = new Date(startDate);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(endDate);
-    end.setHours(0, 0, 0, 0);
-    return d >= start && d <= end;
-  };
+  // Chi viene tolto dalla selezione perde i suoi periodi: se lo si
+  // riseleziona riparte da tutta la durata, non da giorni dimenticati.
+  useEffect(() => {
+    setFormPeriods(prev => {
+      const tenuti = Object.keys(prev).filter(id => selectedTechnicians.includes(Number(id)));
+      if (tenuti.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(tenuti.map(id => [id, prev[id]]));
+    });
+  }, [selectedTechnicians]);
 
-  const getTechnicianConflicts = (technicianId, date) => {
-  const dateStr = date.toISOString().split('T')[0];
-  const techActivities = activities.filter(a => {
-    // Controlla se il tecnico è tra quelli assegnati all'attività
-    const hasTechnician = a.technicians && a.technicians.some(t => t.id === technicianId);
-    return hasTechnician && isDateInRange(dateStr, a.start_date, a.end_date);
-  });
-  return techActivities.length > 1;
-};
+  // Stabile fra un render e l'altro: la griglia lo usa come dipendenza
+  const cambiaPeriodi = useCallback((id, periodi) => {
+    setFormPeriods(prev => ({ ...prev, [id]: periodi }));
+  }, []);
 
   // Indici per evitare scansioni annidate: senza questi, ogni progetto e ogni
   // tecnico riscorrerebbe l'intero elenco attivita' a ogni render (O(n*m)).
@@ -1080,77 +1079,49 @@ const handleSaveActivity = async (activityData) => {
     return m;
   }, [activities]);
 
-  const activitiesByTech = useMemo(() => {
-    const m = new Map();
-    activities.forEach(a => {
-      (a.technicians || []).forEach(t => {
-        if (!m.has(t.id)) m.set(t.id, []);
-        m.get(t.id).push(a);
-      });
-    });
-    return m;
-  }, [activities]);
+  // Viste di assegnazione per tecnico: una per ogni periodo in cui il
+  // tecnico lavora su un'attivita'
+  const viewsByTech = useMemo(() => assignmentsByTech(activities), [activities]);
+
+  // Dati per la griglia delle presenze, ricalcolati solo quando cambiano
+  // i tecnici selezionati o le attivita'
+  const tecniciScelti = useMemo(() =>
+    selectedTechnicians.map(id => technicians.find(x => x.id === id)).filter(Boolean),
+  [selectedTechnicians, technicians]);
+  const impegniAltrove = useMemo(() => new Map(selectedTechnicians.map(id => [id,
+    // Gli altri impegni di ciascun tecnico, esclusa l'attivita' che si modifica
+    (viewsByTech.get(id) || []).filter(v => !editingActivity?.id || v.activity.id !== editingActivity.id)])),
+  [selectedTechnicians, viewsByTech, editingActivity]);
 
   // Conflitti precalcolati una volta sola: con migliaia di attivita' il confronto
   // a coppie a ogni render sarebbe insostenibile. Il calcolo resta GLOBALE, mai
   // filtrato: un tecnico impegnato in Spagna deve risultare occupato anche
   // guardando solo l'Italia.
-  const conflictingActivityIds = useMemo(() => {
-    const byTech = new Map();
-    activities.forEach(a => {
-      (a.technicians || []).forEach(t => {
-        if (!byTech.has(t.id)) byTech.set(t.id, []);
-        byTech.get(t.id).push(a);
-      });
-    });
-    const ids = new Set();
-    byTech.forEach(list => {
-      // Confronto a coppie invece dello scorrimento lineare: con le fasce
-      // orarie la sovrapposizione non e' piu' transitiva — mattina e
-      // pomeriggio dello stesso giorno non sono in conflitto fra loro.
-      // Il costo resta contenuto perche' si confrontano solo le attivita'
-      // dello stesso tecnico, non tutte fra loro.
-      const sorted = [...list].sort((x, y) => new Date(x.start_date) - new Date(y.start_date));
-      for (let i = 0; i < sorted.length; i++) {
-        for (let j = i + 1; j < sorted.length; j++) {
-          // Ordinate per data: appena una inizia dopo la fine della prima,
-          // le successive non possono sovrapporsi.
-          if (new Date(sorted[j].start_date) > new Date(sorted[i].end_date)) break;
-          if (activitiesOverlap(sorted[i], sorted[j])) {
-            ids.add(sorted[i].id);
-            ids.add(sorted[j].id);
-          }
-        }
-      }
-    });
-    return ids;
-  }, [activities]);
-
-
+  // conflictingActivityIds: attivita' con almeno un periodo in conflitto,
+  //   per la vista per progetto, dove ogni attivita' ha una barra sola.
+  // conflictingAssignmentKeys: i singoli periodi in conflitto, per la vista
+  //   per tecnico: la barra di Luca non si colora per un conflitto di Marco.
+  const conflictSets = useMemo(() => conflictMarks(activities), [activities]);
+  const conflictingActivityIds = conflictSets.activityIds;
+  const conflictingAssignmentKeys = conflictSets.assignmentKeys;
 
   // Un'attivita' assegnata a un tecnico durante una sua assenza e' un conflitto,
   // ma di natura diversa dalla doppia assegnazione: va segnalato, mai impedito.
-  // Capita di richiamare qualcuno dalle ferie.
-  const absenceConflicts = useMemo(() => {
+  // Capita di richiamare qualcuno dalle ferie. Conta solo il periodo del
+  // tecnico: un permesso nei giorni in cui lavora un altro non e' un conflitto.
+  const absenceConflicts = useMemo(
+    () => findAbsenceConflicts(activities, absences), [activities, absences]);
+
+  // Le stesse segnalazioni indicizzate per periodo, per la vista per tecnico
+  const absenceByAssignment = useMemo(() => {
     const m = new Map();
-    if (!absences.length) return m;
-    const byTech = new Map();
-    absences.forEach(x => {
-      if (!byTech.has(x.technician_id)) byTech.set(x.technician_id, []);
-      byTech.get(x.technician_id).push(x);
-    });
-    activities.forEach(a => {
-      (a.technicians || []).forEach(tc => {
-        (byTech.get(tc.id) || []).forEach(ab => {
-          if (activitiesOverlap(a, ab)) {
-            if (!m.has(a.id)) m.set(a.id, []);
-            m.get(a.id).push({ tech: tc.name, type: ab.type, from: ab.start_date, to: ab.end_date });
-          }
-        });
-      });
-    });
+    absenceConflicts.forEach(list => list.forEach(x => {
+      const k = assignmentKey(x.assignment);
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(x);
+    }));
     return m;
-  }, [activities, absences]);
+  }, [absenceConflicts]);
 
   // Attivita' che ricadono su un'assenza del tecnico, raggruppate per persona
   const absenceIssues = useMemo(() => {
@@ -1201,13 +1172,13 @@ const handleSaveActivity = async (activityData) => {
     const techSet = new Set(filterTechIds);
     return technicians.filter(t => {
       if (techSet.size && !techSet.has(t.id)) return false;
-      const acts = (activitiesByTech.get(t.id) || []).filter(a => projIds.has(a.project_id));
-      if (acts.length === 0) return false;
+      const viste = (viewsByTech.get(t.id) || []).filter(v => projIds.has(v.project_id));
+      if (viste.length === 0) return false;
       if (q && !t.name.toLowerCase().includes(q)) return false;
-      if (onlyConflicts && !acts.some(a => conflictingActivityIds.has(a.id))) return false;
+      if (onlyConflicts && !viste.some(v => conflictingAssignmentKeys.has(assignmentKey(v)))) return false;
       return true;
     });
-  }, [technicians, projects, activitiesByTech, filterCountries, filterText, filterTechIds, onlyConflicts, conflictingActivityIds]);
+  }, [technicians, projects, viewsByTech, filterCountries, filterText, filterTechIds, onlyConflicts, conflictingAssignmentKeys]);
 
   const toggleCountry = (cc) => {
     setFilterCountries(prev => prev.includes(cc) ? prev.filter(x => x !== cc) : [...prev, cc]);
@@ -1323,25 +1294,11 @@ const handleSaveActivity = async (activityData) => {
         : `repeating-linear-gradient(to right, transparent 0 ${HALF}px, ${colore} ${HALF}px ${DAY_W}px)`;
     };
 
-    // Giorni occupati nel periodo visibile. Conta in mezze giornate: chi lavora
+    // Giorni occupati nel periodo visibile, contati una volta sola anche
+    // quando due impegni si sovrappongono. Conta in mezze giornate: chi lavora
     // solo le mattine occupa mezza unita' per ogni giorno.
-    const loadDays = (acts) => {
-      const busy = new Set();
-      acts.forEach(a => {
-        const p = barPos(a);
-        if (!p) return;
-        const dp = dayPartOf(a);
-        const primaCella = Math.round(p.left / DAY_W);
-        const celle = Math.round(p.width / DAY_W);
-        for (let i = 0; i < celle; i++) {
-          const giorno = primaCella + i;
-          if (dp === 'FULL') { busy.add(giorno * 2); busy.add(giorno * 2 + 1); }
-          else if (dp === 'AM') busy.add(giorno * 2);
-          else busy.add(giorno * 2 + 1);
-        }
-      });
-      return busy.size / 2;
-    };
+    const loadDays = (items) =>
+      occupiedDays(items, isoDay(dates[0]), isoDay(dates[dates.length - 1]));
 
     const isToday = (d) => new Date().toDateString() === d.toDateString();
 
@@ -1364,14 +1321,27 @@ const handleSaveActivity = async (activityData) => {
     );
 
     // ---- Riga attivita' (usata da entrambe le viste) ----
+    // Nella vista per progetto riceve un'attivita'; nella vista per tecnico
+    // una vista di assegnazione, con le date del periodo del tecnico. Per
+    // aprire la finestra di modifica si usa sempre l'attivita' originale:
+    // salvare la vista riscriverebbe le date dell'attivita' con quelle del
+    // tecnico.
     const ActivityRow = ({ activity, label, sub, color, barText }) => {
       const pos = barPos(activity);
-      const techs = activity.technicians || [];
-      // Usa il set precalcolato: getTechnicianConflicts riscansionava tutte le attivita'
-      // per ogni barra, e controllava solo il primo giorno invece dell'intero periodo.
-      const overlap = conflictingActivityIds.has(activity.id);
-      const onLeave = absenceConflicts.has(activity.id);
+      const originale = activity.activity || activity;
+      const techs = originale.technicians || [];
+      const vista = Boolean(activity.activity);
+      // Usa gli insiemi precalcolati: getTechnicianConflicts riscansionava
+      // tutte le attivita' per ogni barra.
+      const overlap = vista
+        ? conflictingAssignmentKeys.has(assignmentKey(activity))
+        : conflictingActivityIds.has(activity.id);
+      const assenze = vista
+        ? (absenceByAssignment.get(assignmentKey(activity)) || [])
+        : (absenceConflicts.get(activity.id) || []);
+      const onLeave = assenze.length > 0;
       const conflict = overlap || onLeave;
+      const periodo = formatActivityPeriod(activity, locale, t('morning'), t('afternoon'));
       return (
         <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid var(--border)', backgroundColor: 'var(--rowAlt)' }}>
           <LeftCell bg="var(--rowAlt)" indent>
@@ -1382,11 +1352,11 @@ const handleSaveActivity = async (activityData) => {
             {pos && (
               <div
                 onClick={() => {
-                  setEditingActivity(activity);
+                  setEditingActivity(originale);
                   setSelectedTechnicians(techs.map(t => t.id));
                   setShowEditModal(true);
                 }}
-                title={`${onLeave ? '⚠ ' + t('duringAbsence') + ': ' + absenceConflicts.get(activity.id).map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${activity.name} — ${activity.start_date} → ${activity.end_date}${dayPartOf(activity) === 'AM' ? ' — ' + t('onlyMorning') : dayPartOf(activity) === 'PM' ? ' — ' + t('onlyAfternoon') : ''} — ${actDurationDays(activity)} ${t('calendarDays')}`}
+                title={`${onLeave ? '⚠ ' + t('duringAbsence') + ': ' + assenze.map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${activity.name} — ${periodo} — ${actDurationDays(activity)} ${t('calendarDays')}`}
                 style={{
                   position: 'absolute', top: 8, height: ROW_H - 16,
                   left: pos.left, width: pos.width,
@@ -1655,7 +1625,9 @@ const handleSaveActivity = async (activityData) => {
                         </span>
                       </div>
                       <div style={{ fontSize: 11, color: onlyConflicts ? '#ef4444' : 'var(--muted)', marginLeft: 24 }}>
-                        {acts.length} {onlyConflicts ? t('inConflict') : t('activityCount')}
+                        {onlyConflicts
+                          ? `${acts.length} ${t('inConflict')}`
+                          : conta(acts.length, 'activityCount1', 'activityCount')}
                       </div>
                     </LeftCell>
                     <div style={{ width: gridW, minWidth: gridW, ...gridBg }} />
@@ -1679,9 +1651,11 @@ const handleSaveActivity = async (activityData) => {
             {groupBy === 'technician' && visibleTechnicians.map(tech => {
               const techAbsences = absences.filter(x => x.technician_id === tech.id);
               const visibleIds = new Set(visibleProjects.map(p => p.id));
-              const acts = (activitiesByTech.get(tech.id) || []).filter(a =>
-                visibleIds.has(a.project_id) &&
-                (!onlyConflicts || conflictingActivityIds.has(a.id))
+              // Una vista per ogni periodo del tecnico: se lavora su
+              // un'attivita' in due momenti, compaiono due barre
+              const acts = (viewsByTech.get(tech.id) || []).filter(v =>
+                visibleIds.has(v.project_id) &&
+                (!onlyConflicts || conflictingAssignmentKeys.has(assignmentKey(v)))
               );
               const expanded = expandedTechs.includes(tech.id);
               const busy = loadDays(acts);
@@ -1705,7 +1679,7 @@ const handleSaveActivity = async (activityData) => {
                         </span>
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 24 }}>
-                        {t('workload')}: {busy}/{dates.length} {t('days')} ({pct}%)
+                        {t('workload')}: {fmtDays(busy, locale)}/{dates.length} {t('days')} ({pct}%)
                       </div>
                     </LeftCell>
 
@@ -1715,12 +1689,23 @@ const handleSaveActivity = async (activityData) => {
                       {techAbsences.map(ab => {
                         const p = barPos(ab);
                         if (!p) return null;
+                        // Mezza giornata: un permesso del pomeriggio parte a
+                        // meta' cella, uno della mattina si ferma a meta'.
+                        // Solo se l'estremo e' visibile: un'assenza iniziata
+                        // il mese prima non va accorciata a sinistra.
+                        let left = p.left;
+                        let width = p.width;
+                        if (ab.start_half === 'PM' && !p.clippedLeft) { left += HALF; width -= HALF; }
+                        if (ab.end_half === 'AM' && isoDay(ab.end_date) <= isoDay(dates[dates.length - 1])) {
+                          width -= HALF;
+                        }
+                        if (width <= 0) return null;
                         return (
                           <div key={'ab' + ab.id}
-                            title={`${t('absence')}: ${t('abs_' + ab.type)}${ab.note ? ' — ' + ab.note : ''}`}
+                            title={`${t('absence')}: ${t('abs_' + ab.type)} — ${formatActivityPeriod(ab, locale, t('morning'), t('afternoon'))}${ab.note ? ' — ' + ab.note : ''}`}
                             style={{
                               position: 'absolute', top: 0, bottom: 0,
-                              left: p.left, width: p.width,
+                              left, width,
                               backgroundImage: 'repeating-linear-gradient(45deg, var(--muted) 0 3px, transparent 3px 8px)',
                               opacity: 0.45, pointerEvents: 'none', zIndex: 1,
                             }} />
@@ -1730,10 +1715,18 @@ const handleSaveActivity = async (activityData) => {
                         const p = barPos(a);
                         if (!p) return null;
                         const prj = projects.find(pr => pr.id === a.project_id);
+                        // Cliccabili come le barre estese: aprono l'attivita'
+                        // originale, non la vista con le date del tecnico
                         return (
-                          <div key={a.id}
-                            title={`${prj ? prj.code + ' — ' : ''}${a.name}`}
+                          <div key={assignmentKey(a)}
+                            title={`${prj ? prj.code + ' — ' : ''}${a.name} — ${formatActivityPeriod(a, locale, t('morning'), t('afternoon'))}\n${t('clickToEdit')}`}
+                            onClick={() => {
+                              setEditingActivity(a.activity);
+                              setSelectedTechnicians((a.activity.technicians || []).map(x => x.id));
+                              setShowEditModal(true);
+                            }}
                             style={{
+                              cursor: 'pointer', zIndex: 2,
                               position: 'absolute', top: 14, height: 20,
                               left: p.left, width: p.width,
                               backgroundColor: dayPartOf(a) === 'FULL' ? (prj?.color || '#555555') : 'transparent',
@@ -1752,11 +1745,16 @@ const handleSaveActivity = async (activityData) => {
 
                   {expanded && acts.map(activity => {
                     const prj = projects.find(pr => pr.id === activity.project_id);
+                    // Un periodo parziale porta le sue date nell'etichetta:
+                    // due periodi della stessa attivita' resterebbero
+                    // altrimenti due righe identiche
                     return (
                       <ActivityRow
-                        key={activity.id}
+                        key={assignmentKey(activity)}
                         activity={activity}
-                        label={activity.name}
+                        label={activity.partial
+                          ? `${activity.name} · ${formatDate(new Date(activity.start_date))} → ${formatDate(new Date(activity.end_date))}`
+                          : activity.name}
                         sub={prj ? `${[countryFlag(prj.country), prj.code].filter(Boolean).join(' ')} - ${prj.name}` : 'Progetto sconosciuto'}
                         color={prj?.color}
                         barText={`${prj ? prj.code + ' · ' : ''}${activity.name} · ${activity.progress ?? 0}%`}
@@ -3073,8 +3071,11 @@ const handleSaveActivity = async (activityData) => {
             showArchived={showArchived}
             onToggleArchived={toggleArchived}
             onActivityClick={(activity) => {
-              setEditingActivity(activity);
-              setSelectedTechnicians(activity.technicians?.map(x => x.id) || []);
+              // Un report puo' passare una vista di assegnazione: si apre
+              // sempre l'attivita' originale
+              const originale = activity.activity || activity;
+              setEditingActivity(originale);
+              setSelectedTechnicians(originale.technicians?.map(x => x.id) || []);
               setShowEditModal(true);
             }}
           />
@@ -3127,7 +3128,7 @@ const handleSaveActivity = async (activityData) => {
                       style={{ padding: '6px 10px', fontSize: 13, border: '1px solid var(--border)', borderRadius: 5, minWidth: 200 }}
                     />
                     <span style={{ fontSize: 13, color: 'var(--muted)' }}>
-                      {list.length} {t('techWithOverlaps')}
+                      {conta(list.length, 'techWithOverlaps1', 'techWithOverlaps')}
                     </span>
                     <button
                       onClick={() => setExpandedConflictTechs(
@@ -3154,14 +3155,19 @@ const handleSaveActivity = async (activityData) => {
                       {[...absenceIssues.entries()].map(([techName, items]) => (
                         <div key={techName} style={{ marginBottom: 6, fontSize: 13 }}>
                           <strong>{techName}</strong>
-                          <span style={{ color: 'var(--muted)' }}> — {items.length} {t('activitiesCol').toLowerCase()}</span>
+                          <span style={{ color: 'var(--muted)' }}> — {conta(items.length, 'activityCount1', 'activityCount')}</span>
                           <div style={{ marginLeft: 14, fontSize: 12, color: 'var(--muted)' }}>
+                            {/* Periodo in cui il tecnico lavora sull'attivita' e periodo
+                                dell'assenza, entrambi con la fascia quando non e'
+                                la giornata intera: e' l'informazione che serve per
+                                decidere se il conflitto e' reale */}
                             {items.map((it, i) => (
                               <div key={i}>
-                                {it.activity.name} · {new Date(it.activity.start_date).toLocaleDateString(locale)}
+                                {it.activity.name} · {formatActivityPeriod(it.absence.assignment, locale, t('morning'), t('afternoon'))}
                                 {' — '}{t('abs_' + it.absence.type)}{' '}
-                                {new Date(it.absence.from).toLocaleDateString(locale)}
-                                {' → '}{new Date(it.absence.to).toLocaleDateString(locale)}
+                                {formatActivityPeriod(
+                                  { start_date: it.absence.from, end_date: it.absence.to, day_part: it.absence.dayPart },
+                                  locale, t('morning'), t('afternoon'))}
                               </div>
                             ))}
                           </div>
@@ -3193,10 +3199,10 @@ const handleSaveActivity = async (activityData) => {
                               backgroundColor: '#dc3545', color: 'white',
                               padding: '2px 10px', borderRadius: 12, fontSize: 12,
                             }}>
-                              {tech.conflicts.length} {t('periods')}
+                              {conta(tech.conflicts.length, 'period1', 'periods')}
                             </span>
                             <span style={{ fontSize: 12, color: 'var(--muted)' }}>
-                              {totAct} {t('involvedActivities')}
+                              {conta(totAct, 'involvedActivity1', 'involvedActivities')}
                             </span>
                           </div>
 
@@ -3216,12 +3222,14 @@ const handleSaveActivity = async (activityData) => {
                                   </div>
 
                                   {cf.activities.map(act => {
+                                    // act e' una vista di assegnazione: le sue date sono
+                                    // quelle del tecnico. Si modifica l'attivita' originale.
                                     const prj = projectsById.get(act.project_id);
                                     return (
-                                      <div key={act.id}
+                                      <div key={assignmentKey(act)}
                                         onClick={() => {
-                                          setEditingActivity(act);
-                                          setSelectedTechnicians(act.technicians?.map(t => t.id) || []);
+                                          setEditingActivity(act.activity);
+                                          setSelectedTechnicians(act.activity.technicians?.map(t => t.id) || []);
                                           setShowActivityModal(true);
                                         }}
                                         title={t('clickToEdit')}
@@ -3246,7 +3254,7 @@ const handleSaveActivity = async (activityData) => {
                                           <span style={{ color: 'var(--muted)' }}> · {prj?.name || 'Progetto sconosciuto'}</span>
                                         </span>
                                         <span style={{ fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>
-                                          {new Date(act.start_date).toLocaleDateString(locale)} → {new Date(act.end_date).toLocaleDateString(locale)}
+                                          {formatActivityPeriod(act, locale, t('morning'), t('afternoon'))}
                                         </span>
                                       </div>
                                     );
@@ -3360,6 +3368,33 @@ const handleSaveActivity = async (activityData) => {
                   })}
                 </select>
               </div>
+              {/* Giorni venduti: facoltativo. Serve al confronto fra quanto si e'
+                  venduto e quanto si e' effettivamente svolto. */}
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>
+                  {t('soldDays')}
+                  <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 6, fontSize: 12 }}>
+                    ({t('optional')})
+                  </span>
+                </label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  value={editingProject?.sold_days ?? ''}
+                  onChange={(e) => setEditingProject({ ...editingProject, sold_days: e.target.value })}
+                  placeholder={t('soldDaysHint')}
+                  style={{
+                    width: '100%', padding: '0.5rem', borderRadius: 5,
+                    border: '1px solid var(--border)', boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }}
+                />
+                <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>
+                  {t('soldDaysProjectHint')}
+                </div>
+              </div>
+
               <div style={{ marginBottom: '1rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('color')}</label>
                 <input
@@ -3630,7 +3665,7 @@ const handleSaveActivity = async (activityData) => {
             padding: '1.25rem 1.5rem',
             borderRadius: 10,
             width: '95%',
-            maxWidth: 860,
+            maxWidth: 1100,
             maxHeight: '92vh',
             overflowY: 'auto',
             border: '1px solid var(--border)',
@@ -3645,11 +3680,14 @@ const handleSaveActivity = async (activityData) => {
               handleSaveActivity({
                 name: formData.get('name'),
                 project_id: parseInt(formData.get('project_id')),
-                technician_ids: selectedTechnicians,
+                // Un periodo per riga; chi non ha nessun giorno viene tolto
+                assignments: toAssignments(selectedTechnicians, formPeriods, formStart, formEnd),
+                required_technicians: formRequired === '' ? '' : Number(formRequired),
                 start_date: formStart,
                 end_date: formEnd,
                 day_part: formDayPart,
-                progress: parseInt(formData.get('progress'))
+                progress: parseInt(formData.get('progress')),
+                sold_days: formData.get('sold_days') || null,
               });
             }}>
               {/* Due colonne: su un portatile la disposizione verticale usciva
@@ -3790,19 +3828,61 @@ const handleSaveActivity = async (activityData) => {
                     {t('dateErrorMsg')}
                   </span>
                 ) : durationDays ? (
-                  <span style={{ color: 'var(--muted)', fontSize: '0.85rem' }}>
-                    {t('duration')}: {durationDays} {durationDays === 1 ? t('oneDay') : t('calendarDays')}
-                    {giorniLavorativi !== null && (
-                      <> · {giorniLavorativi} {t('workingDays')}</>
+                  <>
+                    {/* Prima qui compariva la durata gia' dimezzata per le mezze
+                        giornate, ma con l'etichetta "giorni di calendario" */}
+                    <span style={{ color: 'var(--muted)', fontSize: '0.85rem' }}>
+                      {t('duration')}: {giorniCalendario} {giorniCalendario === 1 ? t('oneDay') : t('calendarDays')}
+                      {giorniLavorativi !== null && (
+                        <> · {giorniLavorativi} {t('workingDays')}</>
+                      )}
+                      {formDayPart !== 'FULL' && (
+                        <> · {formDayPart === 'AM' ? t('onlyMornings') : t('onlyAfternoons')}, {t('equalTo')} {fmtDays(durationDays, locale)} {t('daysWord')}</>
+                      )}
+                      {includeNonLavorativi && (
+                        <span style={{ color: '#f59e0b', marginLeft: 8 }}>
+                          ⚠ {t('includesNonWorking')}
+                        </span>
+                      )}
+                    </span>
+                    {giorniUomoForm.length > 0 && (
+                      <div style={{ color: 'var(--muted)', fontSize: '0.85rem', marginTop: 2 }}>
+                        {t('plannedManDays')}:{' '}
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {fmtDays(giorniUomoForm.reduce((s, [, n]) => s + n, 0), locale)}
+                        </strong>
+                        {' — '}
+                        {giorniUomoForm.map(([id, n]) =>
+                          `${(technicians.find(x => x.id === id) || {}).name || '—'} ${fmtDays(n, locale)}`).join(' · ')}
+                      </div>
                     )}
-                    {includeNonLavorativi && (
-                      <span style={{ color: '#f59e0b', marginLeft: 8 }}>
-                        ⚠ {t('includesNonWorking')}
-                      </span>
-                    )}
-                  </span>
+                  </>
                 ) : null}
               </div>
+              {/* Giorni venduti per questa fase. Chi vende un pacchetto unico
+                  compila il campo sul progetto e lascia vuoto questo. */}
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>
+                  {t('soldDays')}
+                  <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 6, fontSize: 12 }}>
+                    ({t('optional')})
+                  </span>
+                </label>
+                <input
+                  name="sold_days"
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  defaultValue={editingActivity?.sold_days ?? ''}
+                  placeholder={t('soldDaysHint')}
+                  style={{
+                    width: '100%', padding: '0.5rem', borderRadius: 5,
+                    border: '1px solid var(--border)', boxSizing: 'border-box',
+                    backgroundColor: 'var(--surface)', color: 'var(--fg)',
+                  }}
+                />
+              </div>
+
               <div style={{ marginBottom: '1rem' }}>
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('progress')} (%)</label>
                 <input
@@ -3939,6 +4019,24 @@ const handleSaveActivity = async (activityData) => {
               </div>
 
               </div>
+
+              {/* Presenze: per ogni tecnico selezionato, i giorni in cui lavora */}
+              <AssignmentGrid
+                from={dateError ? '' : formStart}
+                to={dateError ? '' : formEnd}
+                dayPart={formDayPart}
+                technicians={tecniciScelti}
+                periods={formPeriods}
+                onChange={cambiaPeriodi}
+                required={formRequired}
+                onRequiredChange={setFormRequired}
+                absences={absences}
+                otherViews={impegniAltrove}
+                dayKind={(g) => (holidays.some(h => (h.country || '').trim() === formCountry && isoDay(h.date) === g) ? 'holiday'
+                  : isNonWorking(g, formCountry, holidays, weekendMap) ? 'rest' : null)}
+                locale={locale}
+                t={t}
+              />
 
               <div style={{ display: 'flex', gap: '1rem' }}>
                 <button
@@ -4180,7 +4278,7 @@ const handleSaveActivity = async (activityData) => {
                 padding: '7px 14px', border: '1px solid #ef4444', color: '#ef4444',
                 borderRadius: 5, cursor: restoring ? 'wait' : 'pointer', fontSize: 13,
               }}>
-                ⬆ {restoring ? t('restoring') : t('restore')}
+                ⬆ {restoring ? t('restoring') : t('restoreBackup')}
                 <input type="file" accept="application/json" disabled={restoring}
                   onChange={(e) => { handleRestore(e.target.files?.[0]); e.target.value = ''; }}
                   style={{ display: 'none' }} />

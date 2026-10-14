@@ -111,13 +111,45 @@ const store = {
   del: (k) => { try { localStorage.removeItem(k); } catch {} },
 };
 
-// Unità di mezza giornata, come nel resto dell'applicazione
+// Unità di mezza giornata, come nel resto dell'applicazione. Servono per le
+// assenze, che possono iniziare al pomeriggio o finire a mezzogiorno.
 const halfUnit = (d, half, isEnd) => {
   const days = Math.floor(new Date(d).getTime() / 86400000);
   return isEnd ? days*2 + (half === 'AM' ? 0 : 1) : days*2 + (half === 'PM' ? 1 : 0);
 };
 const startU = (x) => halfUnit(x.start_date, x.start_half === 'PM' ? 'PM' : 'AM', false);
 const endU   = (x) => halfUnit(x.end_date,   x.end_half   === 'AM' ? 'AM' : 'PM', true);
+
+// Fascia di un'attività: vale per TUTTI i giorni del periodo. 'AM' vuol dire
+// tutte le mattine, non solo la prima. Prima la PWA ragionava sull'inizio e
+// sulla fine: cinque mattine risultavano quattro giornate intere e una mattina.
+// I campi start_half/end_half restano letti solo per i dati più vecchi.
+const fasciaDi = (a) => {
+  const dp = typeof a.day_part === 'string' ? a.day_part.trim().toUpperCase() : '';
+  if (dp === 'AM' || dp === 'PM' || dp === 'FULL') return dp;
+  if (iso(a.start_date) === iso(a.end_date)) {
+    if (a.start_half === 'PM' && a.end_half === 'PM') return 'PM';
+    if (a.start_half === 'AM' && a.end_half === 'AM') return 'AM';
+  }
+  return 'FULL';
+};
+const FASCE = { AM: 'solo mattina', PM: 'solo pomeriggio', FULL: '' };
+
+// Mezza giornata di un'assenza in un certo giorno: un permesso può
+// cominciare al pomeriggio o finire a mezzogiorno
+const fasciaAssenza = (x, giorno) => {
+  const g = iso(giorno);
+  const soloQuelGiorno = iso(x.start_date) === g && iso(x.end_date) === g;
+  if (soloQuelGiorno && x.start_half === 'PM' && x.end_half === 'PM') return 'pomeriggio';
+  if (soloQuelGiorno && x.start_half === 'AM' && x.end_half === 'AM') return 'mattina';
+  if (iso(x.start_date) === g && x.start_half === 'PM') return 'dal pomeriggio';
+  if (iso(x.end_date) === g && x.end_half === 'AM') return 'fino a mezzogiorno';
+  return '';
+};
+
+// Data breve e periodo: un giorno solo non diventa "12/3 → 12/3"
+const breve = (d) => new Date(d).toLocaleDateString('it-IT', { day: 'numeric', month: 'numeric' });
+const intervallo = (da, a) => iso(da) === iso(a) ? breve(da) : breve(da) + ' → ' + breve(a);
 
 const iso = (d) => {
   const x = new Date(d);
@@ -206,8 +238,12 @@ function render(offline) {
   giorni.forEach(giorno => {
     const u0 = halfUnit(iso(giorno), 'AM', false);
     const u1 = halfUnit(iso(giorno), 'PM', true);
+    const g = iso(giorno);
 
-    const att = (dati.activities || []).filter(a => startU(a) <= u1 && endU(a) >= u0);
+    // Ogni voce dell'agenda è un periodo del tecnico (start_date/end_date sono
+    // le sue date, non quelle dell'attività): se lavora su un'attività in due
+    // momenti diversi, compare in due voci. La fascia vale per ogni giorno.
+    const att = (dati.activities || []).filter(a => iso(a.start_date) <= g && g <= iso(a.end_date));
     const ass = (dati.absences  || []).filter(a => startU(a) <= u1 && endU(a) >= u0);
     if (!att.length && !ass.length) return;
     vuoto = false;
@@ -219,17 +255,29 @@ function render(offline) {
     corpo += `<div class="day${isOggi ? ' today' : ''}"><h2>${esc(etichetta)}</h2>`;
 
     ass.forEach(a => {
+      const mezza = fasciaAssenza(a, giorno);
       corpo += `<div class="card abs">
-        <div class="act">🏖 ${esc(TIPI[a.type] || a.type)}</div>
+        <div class="act">🏖 ${esc(TIPI[a.type] || a.type)}${mezza ? ` <span class="prj">· ${esc(mezza)}</span>` : ''}</div>
         ${a.note ? `<div class="prj">${esc(a.note)}</div>` : ''}
       </div>`;
     });
 
     att.forEach(a => {
       // Mezze giornate: si segnala solo quando non è una giornata intera
-      let quando = '';
-      if (iso(a.start_date) === iso(giorno) && a.start_half === 'PM') quando = 'dal pomeriggio';
-      else if (iso(a.end_date) === iso(giorno) && a.end_half === 'AM') quando = 'fino a mezzogiorno';
+      const quando = FASCE[fasciaDi(a)];
+      // Il tecnico vede il suo periodo; quello dell'attività compare solo se
+      // è diverso, per sapere che prima o dopo di lui ci lavora qualcun altro
+      // Colleghi presenti QUEL giorno: chi lavora tutta la durata cambia
+      // compagni da una settimana all'altra. Senza le date (server
+      // precedente) si mostrano tutti, come prima. Un collega con due
+      // periodi compare una volta sola.
+      const colleghi = [];
+      (a.mates || []).forEach(m => {
+        const presente = !m.start_date || (iso(m.start_date) <= g && g <= iso(m.end_date));
+        if (presente && !colleghi.some(x => x.name === m.name)) colleghi.push(m);
+      });
+      const altroPeriodo = a.activity_start_date && a.activity_end_date
+        && (iso(a.activity_start_date) !== iso(a.start_date) || iso(a.activity_end_date) !== iso(a.end_date));
 
       corpo += `<div class="card" style="border-left-color:${esc(a.project_color || '#555')}">
         <div class="top">
@@ -238,12 +286,13 @@ function render(offline) {
         </div>
         <div class="prj">${esc(a.project_name || '')}</div>
         <div class="meta">
-          <span>${esc(new Date(a.start_date).toLocaleDateString('it-IT'))} → ${esc(new Date(a.end_date).toLocaleDateString('it-IT'))}</span>
+          <span>${esc(intervallo(a.start_date, a.end_date))}</span>
           ${quando ? `<span>${esc(quando)}</span>` : ''}
+          ${altroPeriodo ? `<span>attività ${esc(intervallo(a.activity_start_date, a.activity_end_date))}</span>` : ''}
           <span>${a.progress || 0}%</span>
         </div>
-        ${a.mates && a.mates.length ? `<div class="mates">Con: ${
-          a.mates.map(m => `<span class="mate">${esc(m.name)}</span>`).join('')
+        ${colleghi.length ? `<div class="mates">Con: ${
+          colleghi.map(m => `<span class="mate">${esc(m.name)}</span>`).join('')
         }</div>` : ''}
       </div>`;
     });

@@ -151,6 +151,19 @@ export const toInputDate = (d) => {
   return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
 };
 
+// Data nella forma AAAA-MM-GG, qualunque sia la forma di partenza.
+// Il server manda le date delle attivita' come timestamp completi
+// ('2027-02-01T00:00:00.000Z') e quelle dei periodi dei tecnici come date
+// semplici ('2027-02-01'). Confrontate come stringhe sbaglierebbero: per
+// esempio un periodo di un giorno solo risulterebbe "dal 1 al 1".
+// Una data semplice resta com'e'; le altre passano da toInputDate, come in
+// tutto il resto dell'applicazione.
+export const isoDay = (d) => {
+  if (d === null || d === undefined || d === '') return null;
+  if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  return toInputDate(d);
+};
+
 // Split consuntivo / previsto rispetto a una data di riferimento (di norma oggi).
 // Il giorno corrente e' conteggiato come "da svolgere": l'attivita' non e'
 // ancora conclusa mentre la si guarda.

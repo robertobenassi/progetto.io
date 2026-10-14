@@ -200,8 +200,7 @@ const initDB = async () => {
         id SERIAL PRIMARY KEY,
         activity_id INTEGER REFERENCES activities(id) ON DELETE CASCADE,
         technician_id INTEGER REFERENCES technicians(id) ON DELETE CASCADE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(activity_id, technician_id)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
@@ -262,6 +261,17 @@ const initDB = async () => {
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_activities_archived ON activities(archived);
+    `);
+
+    // Giorni uomo venduti. Facoltativi: chi non fa questo tipo di analisi
+    // lascia i campi vuoti e non se ne accorge.
+    //
+    // Su due livelli perche' si vende in due modi: un pacchetto unico per
+    // l'intero progetto, oppure fase per fase. Con gli UPS la seconda e' la
+    // norma, ma capita anche la prima.
+    await pool.query(`
+      ALTER TABLE projects   ADD COLUMN IF NOT EXISTS sold_days NUMERIC(7,1);
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS sold_days NUMERIC(7,1);
     `);
 
     // Registro delle modifiche. Una riga per operazione di scrittura: pesa
@@ -396,6 +406,93 @@ const initDB = async () => {
         END
       WHERE day_part IS NULL OR day_part = 'FULL'
     `);
+
+    // Assegnazioni con un periodo proprio. Su un'attivita' di dieci giorni
+    // puo' lavorare un tecnico i primi cinque e un altro gli altri.
+    // Le date sono facoltative e ogni estremo e' indipendente: vuoto significa
+    // "come l'attivita'". Le assegnazioni esistenti restano valide senza
+    // conversione, e un estremo vuoto segue l'attivita' quando la si sposta.
+    await pool.query(`
+      ALTER TABLE activity_technicians ADD COLUMN IF NOT EXISTS start_date DATE;
+      ALTER TABLE activity_technicians ADD COLUMN IF NOT EXISTS end_date DATE;
+    `);
+
+    // Lo stesso tecnico puo' comparire piu' volte sulla stessa attivita', una
+    // per periodo: nelle fasi di test lunghe settimane un tecnico va su un
+    // altro sito e poi torna. Il vincolo di unicita' delle versioni
+    // precedenti lo impediva. Al suo posto il server controlla che i periodi
+    // dello stesso tecnico non si sovrappongano.
+    // Si cercano sia i vincoli sia gli indici univoci sulla coppia di colonne,
+    // perche' le installazioni piu' vecchie potrebbero avere l'uno o l'altro.
+    const unicita = await pool.query(`
+      SELECT con.conname AS vincolo, idx.relname AS indice
+      FROM pg_index i
+      JOIN pg_class idx ON idx.oid = i.indexrelid
+      LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid AND con.contype = 'u'
+      WHERE i.indrelid = 'activity_technicians'::regclass
+        AND i.indisunique AND NOT i.indisprimary
+        AND (SELECT array_agg(att.attname::text ORDER BY att.attname::text)
+             FROM pg_attribute att
+             WHERE att.attrelid = i.indrelid AND att.attnum = ANY (i.indkey))
+            = ARRAY['activity_id', 'technician_id']
+    `);
+    for (const u of unicita.rows) {
+      if (u.vincolo) {
+        await pool.query(`ALTER TABLE activity_technicians DROP CONSTRAINT "${u.vincolo}"`);
+      } else {
+        await pool.query(`DROP INDEX IF EXISTS "${u.indice}"`);
+      }
+      console.log(`Migrazione: activity_technicians accetta piu' periodi per tecnico (rimosso ${u.vincolo || u.indice})`);
+    }
+
+    // Tecnici richiesti: quante persone servono, per tutta la durata.
+    // Vuoto = nessun requisito; l'attivita' resta fuori dal report fabbisogno.
+    // Un valore predefinito a 1 avrebbe riempito il report di tutte le
+    // attivita' storiche senza tecnici.
+    await pool.query(`
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS required_technicians INTEGER
+        CHECK (required_technicians IS NULL OR required_technicians > 0);
+    `);
+
+    // users.technician_id era stato creato con il comportamento predefinito
+    // (NO ACTION): ogni tecnico creato dall'interfaccia ha un account collegato,
+    // quindi nessun tecnico si poteva eliminare e il ripristino di un backup
+    // falliva. Con SET NULL l'eliminazione scollega l'account invece di
+    // bloccarsi. Il controllo sul catalogo rende la migrazione ripetibile.
+    const fkTecnico = await pool.query(`
+      SELECT c.conname, c.confdeltype
+      FROM pg_constraint c
+      JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = ANY (c.conkey)
+      WHERE c.conrelid = 'users'::regclass AND c.contype = 'f' AND att.attname = 'technician_id'
+    `);
+    const daCorreggere = fkTecnico.rows.filter(r => r.confdeltype !== 'n');
+    if (daCorreggere.length || fkTecnico.rows.length === 0) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const r of daCorreggere) {
+          await client.query(`ALTER TABLE users DROP CONSTRAINT "${r.conname}"`);
+        }
+        // Riferimenti a tecnici che non esistono piu' impedirebbero di
+        // ricreare il vincolo: si azzerano, come farebbe SET NULL.
+        await client.query(`
+          UPDATE users SET technician_id = NULL
+          WHERE technician_id IS NOT NULL
+            AND technician_id NOT IN (SELECT id FROM technicians)
+        `);
+        await client.query(`
+          ALTER TABLE users ADD CONSTRAINT users_technician_id_fkey
+            FOREIGN KEY (technician_id) REFERENCES technicians(id) ON DELETE SET NULL
+        `);
+        await client.query('COMMIT');
+        console.log('Migrazione: users.technician_id ora ON DELETE SET NULL');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+    }
 
     // Festivi per nazione. Una tabella e non una libreria: servono anche le
     // chiusure aziendali e i ponti, che nessuna libreria conosce.
@@ -555,6 +652,127 @@ const validateActivityDates = (start_date, end_date, start_half, end_half) => {
   return null;
 };
 
+// Data nella forma AAAA-MM-GG. Restituisce null per un valore vuoto e
+// undefined per un valore presente ma non valido (per esempio 2027-02-30),
+// cosi' chi la usa distingue "non indicata" da "sbagliata".
+// Con le date in questa forma il confronto fra stringhe segue il calendario.
+const soloData = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v));
+  if (!m) return undefined;
+  const d = new Date(m[1] + 'T00:00:00Z');
+  if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== m[1]) return undefined;
+  return m[1];
+};
+
+// Tecnici richiesti: facoltativo, vuoto significa nessun requisito
+const leggiRichiesti = (v) => {
+  if (v === null || v === undefined || v === '') return { value: null };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 999) {
+    return { error: 'Il numero di tecnici richiesti deve essere un intero positivo' };
+  }
+  return { value: n };
+};
+
+// Assegnazioni dal corpo della richiesta, validate e normalizzate.
+// Ogni assegnazione e' un periodo: lo stesso tecnico puo' averne piu' d'uno
+// sulla stessa attivita', purche' non si sovrappongano.
+//
+// Formato attuale: assignments: [{ technician_id, start_date, end_date }]
+// Formato precedente: technician_ids: [id, ...]
+//
+// Il formato precedente arriva da una scheda del browser rimasta aperta con
+// il codice vecchio dopo un aggiornamento. Non conosce i periodi: se li si
+// azzerasse, ogni salvataggio da quella scheda cancellerebbe quelli
+// impostati da altri. Per questo si conservano quelli gia' salvati.
+const leggiAssegnazioni = (body, actStart, actEnd, esistenti) => {
+  const fuoriDa = (s, e) =>
+    Boolean((s && (s < actStart || s > actEnd)) || (e && (e < actStart || e > actEnd)));
+
+  let elenco;
+  if (Array.isArray(body.assignments)) {
+    elenco = body.assignments.map(x => ({
+      technician_id: Number(x && x.technician_id),
+      start_date: soloData(x && x.start_date),
+      end_date: soloData(x && x.end_date),
+    }));
+    for (const x of elenco) {
+      if (!Number.isInteger(x.technician_id) || x.technician_id <= 0) {
+        return { error: 'Tecnico non valido' };
+      }
+      if (x.start_date === undefined || x.end_date === undefined) {
+        return { error: 'Data dell\'assegnazione non valida' };
+      }
+      // Date inviate esplicitamente: si rifiuta, perche' tagliarle in silenzio
+      // produrrebbe un periodo diverso da quello che l'utente ha visto.
+      if (fuoriDa(x.start_date, x.end_date)) {
+        return { error: `Il periodo di un tecnico deve stare dentro quello dell'attività (${actStart} → ${actEnd})` };
+      }
+    }
+  } else {
+    const grezzi = Array.isArray(body.technician_ids) ? body.technician_ids
+      : (body.technician_ids ? [body.technician_ids] : []);
+    const ids = [...new Set(grezzi.map(Number))];
+    elenco = [];
+    for (const id of ids) {
+      if (!Number.isInteger(id) || id <= 0) return { error: 'Tecnico non valido' };
+      const prec = (esistenti || []).filter(e => Number(e.technician_id) === id);
+      // Se l'attivita' e' stata spostata da chi non vede i periodi e uno di
+      // essi e' rimasto fuori, il tecnico torna su tutta la durata: e' l'unica
+      // scelta che non lascia periodi fuori dall'attivita' o sovrapposti.
+      if (!prec.length || prec.some(p => fuoriDa(p.start_date, p.end_date))) {
+        elenco.push({ technician_id: id, start_date: null, end_date: null });
+      } else {
+        prec.forEach(p => elenco.push({ technician_id: id, start_date: p.start_date, end_date: p.end_date }));
+      }
+    }
+  }
+
+  const out = [];
+  for (const x of elenco) {
+    let s = x.start_date;
+    let e = x.end_date;
+    if (s && e && s > e) {
+      return { error: 'Nel periodo di un tecnico la fine precede l\'inizio' };
+    }
+    // Un estremo uguale a quello dell'attivita' si salva vuoto: cosi' segue
+    // l'attivita' quando la si sposta o la si allunga.
+    if (s === actStart) s = null;
+    if (e === actEnd) e = null;
+    out.push({ technician_id: x.technician_id, start_date: s, end_date: e });
+  }
+
+  // Periodi dello stesso tecnico: non devono sovrapporsi, altrimenti i suoi
+  // giorni verrebbero contati due volte. La fascia (mattina, pomeriggio) e'
+  // dell'attivita' ed e' la stessa per tutti, quindi basta il confronto a
+  // giorni interi.
+  const perTecnico = new Map();
+  out.forEach(x => {
+    if (!perTecnico.has(x.technician_id)) perTecnico.set(x.technician_id, []);
+    perTecnico.get(x.technician_id).push([x.start_date || actStart, x.end_date || actEnd]);
+  });
+  for (const periodi of perTecnico.values()) {
+    periodi.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    for (let i = 1; i < periodi.length; i++) {
+      if (periodi[i][0] <= periodi[i - 1][1]) {
+        return { error: 'Due periodi dello stesso tecnico si sovrappongono' };
+      }
+    }
+  }
+  return { value: out };
+};
+
+// Scrive le assegnazioni di un'attivita' (dentro una transazione gia' aperta)
+const scriviAssegnazioni = async (client, activityId, assegnazioni) => {
+  for (const x of assegnazioni) {
+    await client.query(
+      'INSERT INTO activity_technicians (activity_id, technician_id, start_date, end_date) VALUES ($1, $2, $3, $4)',
+      [activityId, x.technician_id, x.start_date, x.end_date]
+    );
+  }
+};
+
 // Health check
 // Diagnostica: mostra l'indirizzo che il server attribuisce al client.
 // Serve a verificare che il reverse proxy inoltri correttamente X-Forwarded-For,
@@ -672,7 +890,10 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/projects', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
-  const { code, name, color, country } = req.body;
+  const { code, name, color, country, sold_days } = req.body;
+  // Campo facoltativo: stringa vuota e valori non numerici diventano NULL
+  const venduti = (sold_days === '' || sold_days === null || sold_days === undefined
+                   || isNaN(Number(sold_days))) ? null : Number(sold_days);
   const cc = (country || 'IT').toUpperCase();
 
   if (!(await canWriteCountry(req.user, cc))) {
@@ -681,8 +902,8 @@ app.post('/api/projects', authenticateToken, authorize(['admin', 'editor']), asy
 
   try {
     const result = await pool.query(
-      'INSERT INTO projects (code, name, color, country) VALUES ($1, $2, $3, $4) RETURNING *',
-      [code, name, color || '#3b82f6', cc]
+      'INSERT INTO projects (code, name, color, country, sold_days) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [code, name, color || '#3b82f6', cc, venduti]
     );
     const p = result.rows[0];
     await logAudit(req, {
@@ -698,7 +919,9 @@ app.post('/api/projects', authenticateToken, authorize(['admin', 'editor']), asy
 
 app.put('/api/projects/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
-  const { code, name, color, country } = req.body;
+  const { code, name, color, country, sold_days } = req.body;
+  const venduti = (sold_days === '' || sold_days === null || sold_days === undefined
+                   || isNaN(Number(sold_days))) ? null : Number(sold_days);
 
   try {
     const prev = (await pool.query('SELECT * FROM projects WHERE id = $1', [id])).rows[0];
@@ -715,8 +938,8 @@ app.put('/api/projects/:id', authenticateToken, authorize(['admin', 'editor']), 
     }
 
     const result = await pool.query(
-      'UPDATE projects SET code = $1, name = $2, color = $3, country = COALESCE($4, country) WHERE id = $5 RETURNING *',
-      [code, name, color, country ? country.toUpperCase() : null, id]
+      'UPDATE projects SET code = $1, name = $2, color = $3, country = COALESCE($4, country), sold_days = $5 WHERE id = $6 RETURNING *',
+      [code, name, color, country ? country.toUpperCase() : null, venduti, id]
     );
     const p = result.rows[0];
     const details = diffFields(prev, p, ['code', 'name', 'color', 'country']);
@@ -754,21 +977,41 @@ app.delete('/api/projects/:id', authenticateToken, authorize(['admin']), async (
 app.get('/api/activities', authenticateToken, async (req, res) => {
   const includiArchiviati = req.query.archived === 'true' || req.query.all === 'true';
   try {
+    // Due elenchi distinti.
+    // technicians: le persone assegnate, una volta sola anche se hanno piu'
+    //   periodi. E' lo stesso elenco delle versioni precedenti, e serve a
+    //   tutto cio' che chiede "chi lavora qui": nomi, filtri, ricerche.
+    // assignments: i periodi, uno per riga. Una data vuota significa "come
+    //   l'attivita'". Servono ai calcoli che ragionano sui giorni.
+    // Le date passano da to_char: dentro json_build_object PostgreSQL le
+    // scriverebbe come '2027-02-01', mentre quelle dell'attivita' arrivano
+    // dal driver come timestamp completo. Fissare la forma AAAA-MM-GG evita
+    // confronti fra formati diversi.
+    // L'ordine per id e' quello di inserimento: stabile da una lettura all'altra.
     const result = await pool.query(`
-      SELECT 
+      SELECT
         a.*,
-        COALESCE(
-          json_agg(
-            json_build_object('id', t.id, 'name', t.name)
-          ) FILTER (WHERE t.id IS NOT NULL),
-          '[]'
-        ) as technicians
+        COALESCE((
+          SELECT json_agg(json_build_object('id', t.id, 'name', t.name) ORDER BY x.primo)
+          FROM (SELECT technician_id, MIN(id) AS primo
+                FROM activity_technicians
+                WHERE activity_id = a.id
+                GROUP BY technician_id) x
+          JOIN technicians t ON t.id = x.technician_id
+        ), '[]') AS technicians,
+        COALESCE((
+          SELECT json_agg(json_build_object(
+                   'id', at.id,
+                   'technician_id', at.technician_id,
+                   'start_date', to_char(at.start_date, 'YYYY-MM-DD'),
+                   'end_date', to_char(at.end_date, 'YYYY-MM-DD')
+                 ) ORDER BY at.id)
+          FROM activity_technicians at
+          WHERE at.activity_id = a.id
+        ), '[]') AS assignments
       FROM activities a
-      LEFT JOIN activity_technicians at ON a.id = at.activity_id
-      LEFT JOIN technicians t ON at.technician_id = t.id
       ${includiArchiviati ? '' : 'JOIN projects p ON p.id = a.project_id AND p.archived = false'}
       ${includiArchiviati ? '' : 'AND a.archived = false'}
-      GROUP BY a.id
       ORDER BY a.created_at DESC
     `);
     res.json(result.rows);
@@ -779,7 +1022,11 @@ app.get('/api/activities', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
-  const { name, project_id, technician_ids, start_date, end_date, progress, day_part } = req.body;
+  const { name, project_id, start_date, end_date, progress, day_part, sold_days } = req.body;
+  // Facoltativo: si vende a fasi oppure a progetto, e chi non fa questo tipo
+  // di analisi lascia il campo vuoto.
+  const venditaAttivita = (sold_days === '' || sold_days === null || sold_days === undefined
+                           || isNaN(Number(sold_days))) ? null : Number(sold_days);
   // day_part vale per tutta l'attivita'. I vecchi campi start_half/end_half
   // restano popolati in modo coerente per non rompere i dati esistenti.
   const dp = ['AM', 'PM'].includes(day_part) ? day_part : 'FULL';
@@ -790,6 +1037,17 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
   if (dateError) {
     return res.status(400).json({ message: dateError });
   }
+  const actStart = soloData(start_date);
+  const actEnd = soloData(end_date);
+  if (!actStart || !actEnd) {
+    return res.status(400).json({ message: 'Formato data non valido: serve AAAA-MM-GG' });
+  }
+
+  const richiesti = leggiRichiesti(req.body.required_technicians);
+  if (richiesti.error) return res.status(400).json({ message: richiesti.error });
+
+  const assegnazioni = leggiAssegnazioni(req.body, actStart, actEnd, []);
+  if (assegnazioni.error) return res.status(400).json({ message: assegnazioni.error });
 
   const cc = await countryOfProject(project_id);
   if (!(await canWriteCountry(req.user, cc))) {
@@ -802,27 +1060,26 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
     
     // Crea l'attività
     const result = await client.query(
-      'INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half, day_part) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [name, project_id, start_date, end_date, progress || 0, sHalf, eHalf, dp]
+      `INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half,
+                               day_part, sold_days, required_technicians)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [name, project_id, actStart, actEnd, progress || 0, sHalf, eHalf, dp, venditaAttivita, richiesti.value]
     );
     
     const activity = result.rows[0];
-    
-    // Associa i tecnici
-    if (technician_ids && technician_ids.length > 0) {
-      for (const tech_id of technician_ids) {
-        await client.query(
-          'INSERT INTO activity_technicians (activity_id, technician_id) VALUES ($1, $2)',
-          [activity.id, tech_id]
-        );
-      }
-    }
+    await scriviAssegnazioni(client, activity.id, assegnazioni.value);
     
     await client.query('COMMIT');
     await logAudit(req, {
       action: 'create', entityType: 'activity', entityId: activity.id,
       entityLabel: activity.name, country: cc,
-      details: { start_date, end_date, technicians: (technician_ids || []).length },
+      details: {
+        start_date: actStart, end_date: actEnd,
+        technicians: new Set(assegnazioni.value.map(x => x.technician_id)).size,
+        periods: assegnazioni.value.length,
+        partial: assegnazioni.value.filter(x => x.start_date || x.end_date).length,
+        required: richiesti.value,
+      },
     });
     res.status(201).json(activity);
   } catch (error) {
@@ -836,7 +1093,11 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
 
 app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor']), async (req, res) => {
   const { id } = req.params;
-  const { name, project_id, technician_ids, start_date, end_date, progress, day_part } = req.body;
+  const { name, project_id, start_date, end_date, progress, day_part, sold_days } = req.body;
+  // Facoltativo: si vende a fasi oppure a progetto, e chi non fa questo tipo
+  // di analisi lascia il campo vuoto.
+  const venditaAttivita = (sold_days === '' || sold_days === null || sold_days === undefined
+                           || isNaN(Number(sold_days))) ? null : Number(sold_days);
   const dp = ['AM', 'PM'].includes(day_part) ? day_part : 'FULL';
   const sHalf = dp === 'PM' ? 'PM' : 'AM';
   const eHalf = dp === 'AM' ? 'AM' : 'PM';
@@ -845,6 +1106,14 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
   if (dateError) {
     return res.status(400).json({ message: dateError });
   }
+  const actStart = soloData(start_date);
+  const actEnd = soloData(end_date);
+  if (!actStart || !actEnd) {
+    return res.status(400).json({ message: 'Formato data non valido: serve AAAA-MM-GG' });
+  }
+
+  const richiesti = leggiRichiesti(req.body.required_technicians);
+  if (richiesti.error) return res.status(400).json({ message: richiesti.error });
 
   // Serve il permesso sia sul progetto attuale sia su quello di destinazione
   const prevCC = await countryOfActivity(id);
@@ -856,35 +1125,58 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
     return res.status(403).json({ message: `Non puoi spostare l'attività nella nazione ${newCC || '—'}` });
   }
 
+  // Il campo dei tecnici richiesti e' nuovo: un client che non lo invia
+  // non deve cancellare il valore salvato da chi lo conosce.
+  const mandaRichiesti = Object.prototype.hasOwnProperty.call(req.body, 'required_technicians');
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // I periodi attuali servono al formato precedente, che non li conosce
+    // e li deve conservare
+    const esistenti = (await client.query(
+      `SELECT technician_id,
+              to_char(start_date, 'YYYY-MM-DD') AS start_date,
+              to_char(end_date, 'YYYY-MM-DD') AS end_date
+       FROM activity_technicians WHERE activity_id = $1 ORDER BY id`, [id])).rows;
+
+    const assegnazioni = leggiAssegnazioni(req.body, actStart, actEnd, esistenti);
+    if (assegnazioni.error) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: assegnazioni.error });
+    }
     
     // Aggiorna l'attività
     const result = await client.query(
-      'UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5, start_half = $6, end_half = $7, day_part = $8 WHERE id = $9 RETURNING *',
-      [name, project_id, start_date, end_date, progress, sHalf, eHalf, dp, id]
+      `UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5,
+              start_half = $6, end_half = $7, day_part = $8, sold_days = $9,
+              required_technicians = CASE WHEN $11::boolean THEN $10::integer ELSE required_technicians END
+       WHERE id = $12 RETURNING *`,
+      [name, project_id, actStart, actEnd, progress, sHalf, eHalf, dp, venditaAttivita,
+       richiesti.value, mandaRichiesti, id]
     );
-    
-    // Rimuovi vecchie associazioni
-    await client.query('DELETE FROM activity_technicians WHERE activity_id = $1', [id]);
-    
-    // Aggiungi nuove associazioni
-    if (technician_ids && technician_ids.length > 0) {
-      for (const tech_id of technician_ids) {
-        await client.query(
-          'INSERT INTO activity_technicians (activity_id, technician_id) VALUES ($1, $2)',
-          [id, tech_id]
-        );
-      }
+    if (!result.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Attività non trovata' });
     }
+    
+    // Sostituisci le assegnazioni
+    await client.query('DELETE FROM activity_technicians WHERE activity_id = $1', [id]);
+    await scriviAssegnazioni(client, id, assegnazioni.value);
     
     await client.query('COMMIT');
     const upd = result.rows[0];
     await logAudit(req, {
       action: 'update', entityType: 'activity', entityId: upd.id,
       entityLabel: upd.name, country: newCC,
-      details: { start_date: upd.start_date, end_date: upd.end_date, progress: upd.progress },
+      details: {
+        start_date: actStart, end_date: actEnd, progress: upd.progress,
+        technicians: new Set(assegnazioni.value.map(x => x.technician_id)).size,
+        periods: assegnazioni.value.length,
+        partial: assegnazioni.value.filter(x => x.start_date || x.end_date).length,
+        required: upd.required_technicians,
+      },
     });
     res.json(upd);
   } catch (error) {
@@ -991,13 +1283,38 @@ app.put('/api/technicians/:id', authenticateToken, authorize(['admin', 'editor']
 
 app.delete('/api/technicians/:id', authenticateToken, authorize(['admin']), async (req, res) => {
   const { id } = req.params;
-  
+
+  // Ogni tecnico creato dall'interfaccia ha un account "viewer" generato in
+  // automatico, con la sua stessa email. Quell'account si elimina insieme al
+  // tecnico: lasciato attivo resterebbe un accesso senza titolare, lasciato
+  // disattivato impedirebbe di ricreare il tecnico con la stessa email.
+  // Un account a cui e' stato dato un altro ruolo e' invece una persona che
+  // usa l'applicazione: si scollega soltanto, tramite ON DELETE SET NULL.
+  const client = await pool.connect();
   try {
-    await pool.query('DELETE FROM technicians WHERE id = $1', [id]);
+    await client.query('BEGIN');
+    const account = await client.query(
+      "DELETE FROM users WHERE technician_id = $1 AND role = 'viewer' RETURNING email", [id]);
+    const tecnico = await client.query(
+      'DELETE FROM technicians WHERE id = $1 RETURNING id, name, email, home_country', [id]);
+    if (!tecnico.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Tecnico non trovato' });
+    }
+    await client.query('COMMIT');
+    const t = tecnico.rows[0];
+    await logAudit(req, {
+      action: 'delete', entityType: 'technician', entityId: t.id,
+      entityLabel: t.name, country: t.home_country,
+      details: { email: t.email, account_removed: account.rows.length > 0 },
+    });
     res.json({ message: 'Tecnico eliminato' });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Error deleting technician:', error);
     res.status(500).json({ message: 'Errore durante l\'eliminazione del tecnico' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1878,41 +2195,66 @@ app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
   let range = '';
   if (from && to) {
     params.push(to, from);
-    range = `AND a.start_date <= $${params.length - 1} AND a.end_date >= $${params.length}`;
+    range = `AND COALESCE(at.start_date, a.start_date) <= $${params.length - 1}
+             AND COALESCE(at.end_date, a.end_date) >= $${params.length}`;
   }
   try {
+    // Una riga per periodo: se il tecnico lavora su un'attivita' in due
+    // momenti diversi, nella sua agenda compare due volte.
+    // start_date e end_date sono quelli del periodo, non dell'attivita':
+    // nella sua agenda deve comparire solo quando lavora lui.
+    // Le date dell'attivita' restano disponibili a parte.
+    // Gli archiviati restano fuori, come in tutto il resto dell'applicazione.
     const acts = await pool.query(
-      `SELECT a.id, a.name, a.start_date, a.end_date, a.start_half, a.end_half, a.day_part, a.progress,
+      `SELECT a.id, at.id AS assignment_id, a.name,
+              COALESCE(at.start_date, a.start_date) AS start_date,
+              COALESCE(at.end_date, a.end_date) AS end_date,
+              a.start_date AS activity_start_date, a.end_date AS activity_end_date,
+              a.start_half, a.end_half, a.day_part, a.progress,
               p.code AS project_code, p.name AS project_name, p.color AS project_color, p.country
        FROM activities a
        JOIN activity_technicians at ON at.activity_id = a.id
        LEFT JOIN projects p ON p.id = a.project_id
-       WHERE at.technician_id = $1 ${range}
-       ORDER BY a.start_date`, params);
+       WHERE at.technician_id = $1
+         AND COALESCE(a.archived, false) = false
+         AND COALESCE(p.archived, false) = false
+         ${range}
+       ORDER BY COALESCE(at.start_date, a.start_date), a.id, at.id`, params);
 
     const abs = await pool.query(
       `SELECT id, start_date, end_date, start_half, end_half, type, note
        FROM technician_absences WHERE technician_id = $1 ORDER BY start_date`,
       [req.device.technician_id]);
 
-    // I colleghi assegnati alle stesse attivita': serve sapere con chi si lavora
+    // I colleghi assegnati alle stesse attivita': serve sapere con chi si lavora.
+    // Solo chi c'e' davvero insieme a lui, periodo per periodo: su
+    // un'attivita' di dieci giorni, chi lavora i primi cinque non incontra
+    // chi arriva il sesto. Ogni collega porta le sue date, cosi' la PWA puo'
+    // mostrare giorno per giorno chi c'e': chi lavora tutta la durata ha
+    // colleghi diversi nelle diverse settimane.
     const mates = await pool.query(
-      `SELECT DISTINCT at2.activity_id, t.name, t.color
+      `SELECT DISTINCT at1.id AS assignment_id, t.name, t.color,
+              COALESCE(at2.start_date, a.start_date) AS start_date,
+              COALESCE(at2.end_date, a.end_date) AS end_date
        FROM activity_technicians at1
+       JOIN activities a ON a.id = at1.activity_id
        JOIN activity_technicians at2 ON at2.activity_id = at1.activity_id
        JOIN technicians t ON t.id = at2.technician_id
-       WHERE at1.technician_id = $1 AND at2.technician_id <> $1`,
+       WHERE at1.technician_id = $1 AND at2.technician_id <> $1
+         AND COALESCE(at2.start_date, a.start_date) <= COALESCE(at1.end_date, a.end_date)
+         AND COALESCE(at2.end_date, a.end_date) >= COALESCE(at1.start_date, a.start_date)`,
       [req.device.technician_id]);
 
-    const byAct = {};
+    const perPeriodo = {};
     mates.rows.forEach(m => {
-      (byAct[m.activity_id] = byAct[m.activity_id] || []).push({ name: m.name, color: m.color });
+      (perPeriodo[m.assignment_id] = perPeriodo[m.assignment_id] || [])
+        .push({ name: m.name, color: m.color, start_date: m.start_date, end_date: m.end_date });
     });
 
     res.json({
       technician: { id: req.device.technician_id, name: req.device.name,
                     home_country: req.device.home_country, color: req.device.color },
-      activities: acts.rows.map(a => ({ ...a, mates: byAct[a.id] || [] })),
+      activities: acts.rows.map(a => ({ ...a, mates: perPeriodo[a.assignment_id] || [] })),
       absences: abs.rows,
     });
   } catch (error) {
@@ -2053,29 +2395,38 @@ app.post('/api/projects/:id/duplicate', authenticateToken, authorize(['admin', '
     await client.query('BEGIN');
 
     const np = (await client.query(
-      'INSERT INTO projects (code, name, color, country) VALUES ($1,$2,$3,$4) RETURNING *',
-      [code || `${src.code}-COPY`, name || `${src.name} (copia)`, src.color, newCC]
+      'INSERT INTO projects (code, name, color, country, sold_days) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [code || `${src.code}-COPY`, name || `${src.name} (copia)`, src.color, newCC, src.sold_days]
     )).rows[0];
 
     const acts = (await client.query(
-      'SELECT * FROM activities WHERE project_id = $1 ORDER BY start_date', [id])).rows;
+      'SELECT id FROM activities WHERE project_id = $1 ORDER BY start_date, id', [id])).rows;
 
+    // La copia si fa interamente in SQL: le date non passano da JavaScript,
+    // quindi nessun fuso orario puo' spostarle di un giorno.
+    // Prima di questa versione fascia e giorni venduti non venivano copiati:
+    // un'attivita' di sole mattine diventava di giornate intere.
     for (const a of acts) {
       const na = (await client.query(
-        `INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half)
-         VALUES ($1,$2,$3::date + $4::int,$5::date + $4::int,0,$6,$7) RETURNING id`,
-        [a.name, np.id, a.start_date, shift, a.end_date, a.start_half, a.end_half]
+        `INSERT INTO activities (name, project_id, start_date, end_date, progress,
+                                 start_half, end_half, day_part, sold_days, required_technicians)
+         SELECT name, $1, start_date + $2::int, end_date + $2::int, 0,
+                start_half, end_half, day_part, sold_days, required_technicians
+         FROM activities WHERE id = $3
+         RETURNING id`,
+        [np.id, shift, a.id]
       )).rows[0];
 
       // I tecnici si copiano: chi ha fatto l'intervento la volta scorsa e'
       // il candidato piu' probabile anche stavolta, e si cambia in un clic.
-      const techs = (await client.query(
-        'SELECT technician_id FROM activity_technicians WHERE activity_id = $1', [a.id])).rows;
-      for (const tt of techs) {
-        await client.query(
-          'INSERT INTO activity_technicians (activity_id, technician_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
-          [na.id, tt.technician_id]);
-      }
+      // Ogni periodo trasla insieme all'attivita'; una data vuota resta
+      // vuota e continua a seguire l'attivita'.
+      await client.query(
+        `INSERT INTO activity_technicians (activity_id, technician_id, start_date, end_date)
+         SELECT $1, technician_id, start_date + $2::int, end_date + $2::int
+         FROM activity_technicians WHERE activity_id = $3
+         ORDER BY id`,
+        [na.id, shift, a.id]);
     }
 
     await client.query('COMMIT');
@@ -2102,10 +2453,15 @@ app.post('/api/projects/:id/duplicate', authenticateToken, authorize(['admin', '
 // L'ordine e' quello di inserimento: le dipendenze prima di chi le usa.
 // user_countries non ha una colonna id (la chiave e' la coppia utente/nazione),
 // quindi l'ordinamento va dichiarato tabella per tabella.
+//
+// I tecnici vengono prima degli utenti: ogni tecnico ha un account collegato
+// (users.technician_id), e con l'ordine opposto il ripristino falliva sempre
+// sul vincolo. L'ordine conta solo qui, non nel file: anche i backup creati
+// con la versione precedente si ripristinano.
 const BACKUP_TABLES = [
+  { name: 'technicians',          orderBy: 'id' },
   { name: 'users',                orderBy: 'id' },
   { name: 'user_countries',       orderBy: 'user_id, country' },
-  { name: 'technicians',          orderBy: 'id' },
   { name: 'projects',             orderBy: 'id' },
   { name: 'activities',           orderBy: 'id' },
   { name: 'activity_technicians', orderBy: 'id' },
@@ -2161,6 +2517,11 @@ app.post('/api/admin/restore', authenticateToken, authorize(['admin']), async (r
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // Gli inviti non fanno parte del backup ma riferiscono gli utenti che
+    // li hanno creati: senza toglierli prima, gli utenti non si cancellano.
+    // Sono codici monouso, e sparirebbero comunque con i tecnici.
+    await client.query('DELETE FROM technician_invites');
 
     // Ordine inverso per le dipendenze
     for (const { name } of [...BACKUP_TABLES].reverse()) {

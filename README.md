@@ -1,3 +1,5 @@
+*[English version below](#english)*
+
 # Progetto.io
 
 Pianificazione di progetti e tecnici su più paesi: diagramma di Gantt,
@@ -6,8 +8,6 @@ rilevamento dei conflitti, report e app per i tecnici sul campo.
 Nato per il lavoro su impianti e cantieri, dove le squadre si spostano fra sedi
 e nazioni diverse e sapere chi è dove conta più di ogni altra cosa.
 
-*[English version below](#english)*
-
 ## Cosa fa
 
 - **Gantt** per progetto o per tecnico, vista settimana o mese
@@ -15,9 +15,12 @@ e nazioni diverse e sapere chi è dove conta più di ogni altra cosa.
 - **Giorni lavorativi**: indicando una durata, la fine salta riposi e festivi
 - **Festivi per nazione**, calcolati per 31 paesi o inseriti a mano
 - **Conflitti** rilevati da soli: doppie assegnazioni e lavoro durante le assenze
+- **Assegnazioni a periodi**: un tecnico può lavorare solo su alcuni giorni di un'attività, anche in più periodi, impostati con una griglia delle presenze
+- **Tecnici richiesti** per attività, con il fabbisogno dei giorni ancora scoperti
+- **Giorni uomo venduti** per progetto o per fase, confrontati con quelli svolti
 - **Assenze** dei tecnici, anche a mezza giornata
 - **Multi-paese**: ogni progetto ha una nazione, gli editor lavorano sulle proprie
-- **Nove report** esportabili in CSV e stampabili in PDF
+- **Undici report** esportabili in CSV e stampabili in PDF
 - **App per i tecnici**: ognuno vede le proprie attività dal telefono, senza password
 - **Archiviazione** dei lavori conclusi, che escono dal Gantt ma restano nei report
 - **Manutenzione**: backup, ripristino, registro modifiche, aggiornamenti
@@ -28,8 +31,12 @@ e nazioni diverse e sapere chi è dove conta più di ogni altra cosa.
 
 React · Node.js/Express · PostgreSQL 15 · Caddy · Docker
 
-Nessun servizio a pagamento, nessuna chiamata a server esterni, nessuna
-telemetria. I dati restano sul server di chi installa.
+Non richiede abbonamenti né servizi di terze parti e non invia telemetria: i
+dati restano sul server di chi installa. Oltre al server di posta, se lo si
+configura, l'unico contatto esterno è il controllo giornaliero degli
+aggiornamenti su GitHub, fatto dal browser dell'amministratore senza inviare
+dati dell'applicazione. L'uso commerciale richiede una licenza: vedi
+[Licenza](#licenza).
 
 ---
 
@@ -376,9 +383,12 @@ locations and countries and knowing who is where matters more than anything.
 - **Working days**: enter a duration and the end date skips rest days and holidays
 - **Holidays per country**, computed for 31 countries or entered manually
 - **Conflicts** detected automatically: double bookings and work during absences
+- **Assignments by period**: a technician can work on just some days of an activity, even in several periods, set on a presence grid
+- **Required technicians** per activity, with the staffing gaps still to fill
+- **Sold man-days** per project or per phase, compared with those done
 - **Absences**, down to half a day
 - **Multi-country**: each project has a country, editors work on their own
-- **Nine reports**, exportable to CSV and printable to PDF
+- **Eleven reports**, exportable to CSV and printable to PDF
 - **Technician app**: everyone sees their own assignments from their phone, no password
 - **Archiving** of completed work: it leaves the Gantt but stays in reports
 - **Maintenance**: backup, restore, change log, updates
@@ -389,8 +399,11 @@ locations and countries and knowing who is where matters more than anything.
 
 React · Node.js/Express · PostgreSQL 15 · Caddy · Docker
 
-No paid services, no calls to external servers, no telemetry. Data stays on the
-server of whoever installs it.
+It needs no subscriptions or third-party services and sends no telemetry:
+data stays on the server of whoever installs it. Apart from the mail server, if
+one is configured, the only external contact is the daily update check on
+GitHub, made by the administrator's browser without sending any application
+data. Commercial use requires a licence: see [Licence](#licence).
 
 ---
 

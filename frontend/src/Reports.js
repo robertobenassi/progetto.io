@@ -1,8 +1,11 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
   actDurationDays, daysInRange, overlapsRange, actStartUnit, actEndUnit, splitDays, halfUnit,
-  formatActivityPeriod, fmtDays, countryFlag, toInputDate,
+  formatActivityPeriod, fmtDays, countryFlag, toInputDate, dayPartOf,
 } from './dateUtils';
+// I report ragionano per periodo di assegnazione: un tecnico puo' lavorare
+// solo su una parte di un'attivita', anche in piu' periodi separati
+import { assignmentsOf, occupiedDays, coverageGaps } from './planning.js';
 
 // Quali colonne sono numeriche, dedotto dai dati.
 // La regola precedente ("le ultime due a destra") era arbitraria: in Giorni uomo
@@ -25,16 +28,24 @@ const numericColumns = (rows) => {
 };
 
 // Larghezze di colonna condivise fra i gruppi: le numeriche sono strette e
-// fisse, la prima prende piu' spazio, le restanti si dividono il resto.
-const columnWidths = (headers, num) => {
-  const n = headers.length;
-  const numCount = [...num].length;
+// fisse, le altre si dividono il resto in proporzione al testo che devono
+// contenere. Prima la prima colonna prendeva un terzo dello spazio e le altre
+// parti uguali: un periodo con la fascia ("22/02/2027 → 23/02/2027
+// (Pomeriggio)") finiva troncato accanto a colonne quasi vuote.
+// Si misurano tutte le righe di tutti i gruppi, cosi' le colonne restano
+// allineate da un gruppo all'altro.
+const columnWidths = (headers, num, rows = []) => {
   const numW = 11;                       // % per ogni colonna di numeri
-  const rest = 100 - numCount * numW;
-  const textCols = n - numCount;
-  const firstW = textCols > 1 ? rest * 0.34 : rest;
-  const otherW = textCols > 1 ? (rest - firstW) / (textCols - 1) : 0;
-  return headers.map((_, i) => num.has(i) ? `${numW}%` : (i === 0 ? `${firstW}%` : `${otherW}%`));
+  const rest = 100 - [...num].length * numW;
+  const peso = headers.map((h, i) => {
+    if (num.has(i)) return 0;
+    let lung = String(h ?? '').length;
+    rows.forEach(r => { lung = Math.max(lung, String(r[i] ?? '').length); });
+    // Un tetto evita che una nota lunghissima schiacci tutte le altre colonne
+    return Math.min(Math.max(lung, 6), 40);
+  });
+  const totale = peso.reduce((s, x) => s + x, 0) || 1;
+  return headers.map((_, i) => num.has(i) ? `${numW}%` : `${(rest * peso[i]) / totale}%`);
 };
 
 // ---------------------------------------------------------------------------
@@ -86,9 +97,10 @@ const printReport = (title, subtitle, headers, rows, groups) => {
             color: #9ca3af; font-size: 8pt; }
   `;
 
+  const tutte = groups ? groups.flatMap(g => g.rows) : rows;
   const table = (hd, rw) => {
-    const num = numericColumns(rw);
-    const widths = columnWidths(hd, num);
+    const num = numericColumns(tutte);
+    const widths = columnWidths(hd, num, tutte);
     return `
     <table>
       <colgroup>${widths.map(w => `<col style="width:${w}">`).join('')}</colgroup>
@@ -128,6 +140,8 @@ const printReport = (title, subtitle, headers, rows, groups) => {
 const REPORT_TYPES = [
   { id: 'today',      labelKey: 'repToday' },
   { id: 'available',  labelKey: 'repAvailable' },
+  // Accanto a Disponibili: uno dice chi manca, l'altro chi e' libero
+  { id: 'staffing',   labelKey: 'repStaffing' },
   { id: 'agenda',     labelKey: 'repAgenda' },
   { id: 'workload',   labelKey: 'repWorkload' },
   { id: 'mandays',    labelKey: 'repMandays' },
@@ -135,6 +149,8 @@ const REPORT_TYPES = [
   { id: 'byCountry',  labelKey: 'repByCountry' },
   { id: 'overdue',    labelKey: 'repOverdue' },
   { id: 'absences',   labelKey: 'repAbsences' },
+  // Esisteva gia' tutto il calcolo, ma la scheda non era mai stata aggiunta
+  { id: 'soldvsdone', labelKey: 'repSoldVsDone' },
 ];
 
 function Reports({ projects, activities, technicians, absences = [], t, locale, onActivityClick, canEdit, showArchived, onToggleArchived }) {
@@ -172,6 +188,37 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
     });
   }, [activities, from, to, countryFilter, projectFilter, projectsById]);
 
+  // Cambiando la data iniziale, la finale si sposta e conserva la lunghezza
+  // del periodo: se era di mesi interi resta di mesi interi (da ottobre a
+  // febbraio porta "al" a fine febbraio), altrimenti mantiene i giorni.
+  // Prima "al" restava ferma e il periodo poteva rovesciarsi, con un report
+  // di zeri senza spiegazione.
+  // Il riferimento e' l'ultimo periodo valido: mentre si digita l'anno il
+  // campo passa per date come 0002-02-01, che non devono spostare nulla.
+  const ultimoValido = useRef({ from, to });
+  const plausibile = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && Number(d.slice(0, 4)) >= 1900;
+  if (plausibile(from) && plausibile(to) && from <= to) ultimoValido.current = { from, to };
+
+  const cambiaInizio = (nuovo) => {
+    setFrom(nuovo);
+    if (!plausibile(nuovo)) return;
+    const { from: da, to: a } = ultimoValido.current;
+    const g = (x) => new Date(x + 'T00:00:00Z');
+    const d0 = g(da), d1 = g(a), n = g(nuovo);
+    const ultimoDelMese = (y, m) => new Date(Date.UTC(y, m + 1, 0));
+    const mesiInteri = d0.getUTCDate() === 1
+      && d1.getUTCDate() === ultimoDelMese(d1.getUTCFullYear(), d1.getUTCMonth()).getUTCDate();
+    let fine;
+    if (mesiInteri && n.getUTCDate() === 1) {
+      const mesi = (d1.getUTCFullYear() - d0.getUTCFullYear()) * 12 + d1.getUTCMonth() - d0.getUTCMonth();
+      fine = ultimoDelMese(n.getUTCFullYear(), n.getUTCMonth() + mesi);
+    } else {
+      fine = new Date(n.getTime() + (d1 - d0));
+    }
+    setTo(fine.toISOString().slice(0, 10));
+  };
+  const periodoRovesciato = Boolean(from && to && to < from);
+
   const periodLabel = `${new Date(from).toLocaleDateString(locale)} → ${new Date(to).toLocaleDateString(locale)}`;
   const periodDays = Math.round((new Date(to) - new Date(from)) / 86400000) + 1;
 
@@ -181,6 +228,24 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
   const data = useMemo(() => {
     const P = (id) => projectsById.get(id);
     const techOf = (a) => a.technicians || [];
+    // Periodi dei tecnici nelle attivita' indicate che toccano il periodo del
+    // report. Ogni periodo ha le date del tecnico; .activity e' l'originale.
+    const periodiIn = (acts) => acts.flatMap(assignmentsOf).filter(v => overlapsRange(v, from, to));
+    const passaFiltri = (a) => {
+      if (projectFilter && String(a.project_id) !== String(projectFilter)) return false;
+      if (countryFilter) {
+        const p = projectsById.get(a.project_id);
+        if (!p || p.country !== countryFilter) return false;
+      }
+      return true;
+    };
+    // Mezze giornate di una data coperte da un impegno o da un'assenza:
+    // l'unita' pari e' la mattina, la dispari il pomeriggio
+    const metaCoperte = (x, u0, u1) => {
+      const dp = dayPartOf(x);
+      return [u0, u1].filter(u => actStartUnit(x) <= u && u <= actEndUnit(x)
+        && (dp === 'FULL' || (dp === 'AM' && u % 2 === 0) || (dp === 'PM' && u % 2 === 1)));
+    };
 
     // 0. SITUAZIONE A UNA DATA — chi e' dove, chi e' assente, chi e' libero.
     // Usa la data di inizio periodo come riferimento: cosi' si puo' guardare
@@ -195,51 +260,53 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
       // componente tabella generico, che serve agli altri report.
       const groups = [];
       const flat = [];
+      const periodi = activities.filter(passaFiltri).flatMap(assignmentsOf);
 
       technicians
         .filter(tech => !techFilter || String(tech.id) === String(techFilter))
         .forEach(tech => {
-          const acts = activities.filter(a =>
-            (a.technicians || []).some(x => x.id === tech.id) &&
-            actStartUnit(a) <= u1 && actEndUnit(a) >= u0
-          ).filter(a => {
-            if (projectFilter && String(a.project_id) !== String(projectFilter)) return false;
-            if (countryFilter) {
-              const p = projectsById.get(a.project_id);
-              if (!p || p.country !== countryFilter) return false;
-            }
-            return true;
-          });
-
+          // Periodi del tecnico che toccano quella data (non l'attivita' intera)
+          const impegni = periodi.filter(v => v.technician.id === tech.id
+            && metaCoperte(v, u0, u1).length > 0);
           const abs = absences.filter(x =>
-            x.technician_id === tech.id &&
-            actStartUnit(x) <= u1 && actEndUnit(x) >= u0
-          );
+            x.technician_id === tech.id && metaCoperte(x, u0, u1).length > 0);
 
           const filtered = projectFilter || countryFilter;
-          if (filtered && acts.length === 0) return;
+          if (filtered && impegni.length === 0) return;
 
           const home = tech.home_country ? `${[countryFlag(tech.home_country), tech.home_country].filter(Boolean).join(' ')}` : '—';
 
-          if (abs.length) {
-            groups.push({ id: tech.id, order: 1, name: tech.name, color: tech.color, home,
-              status: 'absent', label: t('abs_' + abs[0].type), items: [] });
-            flat.push([tech.name, home, t('abs_' + abs[0].type), '—', '—', '—']);
-          } else if (acts.length) {
-            const items = acts.map(a => {
-              const p = projectsById.get(a.project_id);
+          // Mezze giornate di lavoro non coperte da un'assenza: un permesso il
+          // pomeriggio non cancella la mattina di lavoro. Prima bastava
+          // un'assenza qualsiasi per mostrare il tecnico come assente tutto
+          // il giorno.
+          const metaAssente = new Set(abs.flatMap(x => metaCoperte(x, u0, u1)));
+          const lavora = impegni.some(v => metaCoperte(v, u0, u1).some(u => !metaAssente.has(u)));
+          const notaAssenza = abs.length
+            ? `${t('abs_' + abs[0].type)}${metaAssente.size === 1
+                ? ` (${metaAssente.has(u0) ? t('morning') : t('afternoon')})` : ''}`
+            : '';
+
+          if (lavora) {
+            const items = impegni.map(v => {
+              const p = projectsById.get(v.project_id);
               return {
                 project: p ? `${p.code} - ${p.name}` : '—',
                 code: p?.code || '—',
                 color: p?.color,
                 country: p?.country ? `${[countryFlag(p.country), p.country].filter(Boolean).join(' ')}` : '—',
-                activity: a.name,
-                act: a,
+                activity: v.name,
+                act: v.activity,
               };
             });
+            const label = notaAssenza ? `${t('atWork')} · ${notaAssenza}` : t('atWork');
             groups.push({ id: tech.id, order: 0, name: tech.name, color: tech.color, home,
-              status: 'busy', label: t('atWork'), items });
-            items.forEach(it => flat.push([tech.name, home, t('atWork'), it.project, it.activity, it.country]));
+              status: 'busy', label, note: notaAssenza, items });
+            items.forEach(it => flat.push([tech.name, home, label, it.project, it.activity, it.country]));
+          } else if (abs.length) {
+            groups.push({ id: tech.id, order: 1, name: tech.name, color: tech.color, home,
+              status: 'absent', label: notaAssenza, items: [] });
+            flat.push([tech.name, home, notaAssenza, '—', '—', '—']);
           } else {
             groups.push({ id: tech.id, order: 2, name: tech.name, color: tech.color, home,
               status: 'free', label: t('free'), items: [] });
@@ -262,6 +329,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
     // stanno in cima e ognuno porta con se' le informazioni per decidere:
     // quanto e' carico, dov'e' di base, cosa sa fare, dove ha lavorato.
     if (reportType === 'available') {
+      const tuttiIPeriodi = activities.flatMap(assignmentsOf);
       const u0 = halfUnit(from, 'AM', false);
       const u1 = halfUnit(to, 'PM', true);
       const q = skillFilter.trim().toLowerCase();
@@ -271,28 +339,28 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
         .filter(tech => !q || (tech.specialization || '').toLowerCase().includes(q)
                           || tech.name.toLowerCase().includes(q))
         .map(tech => {
-          const impegni = activities.filter(a =>
-            (a.technicians || []).some(x => x.id === tech.id) &&
-            actStartUnit(a) <= u1 && actEndUnit(a) >= u0
-          );
+          // Periodi del tecnico nel periodo richiesto, non attivita' intere
+          const suoi = tuttiIPeriodi.filter(v => v.technician.id === tech.id);
+          const impegni = suoi.filter(v => actStartUnit(v) <= u1 && actEndUnit(v) >= u0);
           const assenze = absences.filter(x =>
             x.technician_id === tech.id && actStartUnit(x) <= u1 && actEndUnit(x) >= u0
           );
 
-          // Giorni gia' occupati nel periodo richiesto
-          const occupati = impegni.reduce((s, a) => s + daysInRange(a, from, to), 0)
-                         + assenze.reduce((s, x) => s + daysInRange(x, from, to), 0);
+          // Giorni gia' occupati nel periodo richiesto, contati una volta sola:
+          // con due impegni nello stesso giorno, o un impegno durante
+          // un'assenza, la somma superava i giorni del periodo.
+          const occupati = occupiedDays([...impegni, ...assenze], from, to);
           const liberi = Math.max(0, periodDays - occupati);
+          const nAttivita = new Set(impegni.map(v => v.activity.id)).size;
 
           // Nazioni dove ha lavorato negli ultimi mesi: chi conosce gia' il
           // posto e' il candidato migliore a parita' di disponibilita'.
-          const recenti = [...new Set(activities
-            .filter(a => (a.technicians || []).some(x => x.id === tech.id))
-            .map(a => projectsById.get(a.project_id)?.country)
+          const recenti = [...new Set(suoi
+            .map(v => projectsById.get(v.project_id)?.country)
             .filter(Boolean))];
 
           const stato = assenze.length ? 'absent' : impegni.length ? 'partial' : 'free';
-          return { tech, stato, liberi, occupati, impegni, assenze, recenti };
+          return { tech, stato, liberi, occupati, impegni, nAttivita, assenze, recenti };
         })
         // Prima chi e' del tutto libero, poi chi lo e' in parte, infine gli
         // assenti; a parita', chi ha piu' giorni disponibili.
@@ -306,7 +374,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
       const etichettaStato = (r) =>
         r.stato === 'free' ? `○ ${t('free')}`
         : r.stato === 'absent' ? `🏖 ${t('abs_' + (r.assenze[0]?.type || 'vacation'))}`
-        : `● ${r.impegni.length} ${t('activitiesCol').toLowerCase()}`;
+        : `● ${r.nAttivita} ${t(r.nAttivita === 1 ? 'activityCount1' : 'activityCount')}`;
 
       return {
         headers: [t('technician'), t('status'), t('specialization'), t('baseCountry'),
@@ -324,6 +392,155 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
       };
     }
 
+    // 0c. VENDUTO E SVOLTO — quanto e' stato venduto contro quanto e' stato
+    // fatto davvero. Serve al venditore quando il lavoro eccede il contratto:
+    // per chiedere un'integrazione bisogna poterla documentare, quindi non
+    // basta il totale, servono le attivita' che lo compongono.
+    if (reportType === 'soldvsdone') {
+      // Giorni uomo pianificati di un'attivita': la durata di ogni periodo di
+      // ogni tecnico. Senza tecnici conta come una persona, come nel report
+      // Giorni uomo. Prima si usava la durata dell'attivita': cinque giorni
+      // con due tecnici valevano 5 qui e 10 in Giorni uomo.
+      const giorniUomo = (a) => {
+        const periodi = assignmentsOf(a);
+        return periodi.length
+          ? periodi.reduce((s, v) => s + actDurationDays(v), 0)
+          : actDurationDays(a);
+      };
+      const righe = projects
+        .filter(p => !countryFilter || p.country === countryFilter)
+        .filter(p => !projectFilter || String(p.id) === String(projectFilter))
+        .map(p => {
+          const acts = (activities || []).filter(a => a.project_id === p.id);
+
+          // Si vende in due modi: a fasi, oppure un pacchetto unico. Se le
+          // attivita' portano un valore, quella e' la ripartizione reale.
+          const vendutoFasi = acts.reduce((s, a) => s + (Number(a.sold_days) || 0), 0);
+          const vendutoProgetto = Number(p.sold_days) || 0;
+          const venduto = vendutoFasi > 0 ? vendutoFasi : vendutoProgetto;
+          if (!venduto) return null;          // senza un valore non c'e' confronto
+
+          // Svolto: giorni uomo delle attivita' completate, mezze giornate
+          // contate per meta'. Il parziale segue l'avanzamento dichiarato.
+          const svolto = acts.reduce((s, a) =>
+            s + giorniUomo(a) * ((Number(a.progress) || 0) / 100), 0);
+          const previsto = acts.reduce((s, a) => s + giorniUomo(a), 0);
+
+          const scarto = svolto - venduto;
+          const avanzamento = previsto > 0 ? (svolto / previsto) * 100 : 0;
+
+          // Quanto del venduto e' gia' stato consumato. Confrontato con
+          // l'avanzamento dice se il progetto sta per sforare: al 40% di
+          // lavoro fatto con il 70% dei giorni gia' spesi, il conto finale
+          // non torna — ed e' un'informazione utile ora, non a consegna.
+          const consumo = venduto > 0 ? (svolto / venduto) * 100 : 0;
+
+          // Proiezione a finire: se il ritmo resta questo, quanto costera'
+          // in tutto. Con il previsto gia' pianificato la stima e' migliore
+          // di una semplice estrapolazione lineare.
+          const proiezione = Math.max(previsto, svolto);
+          const scartoFinale = proiezione - venduto;
+
+          // Il segnale: consuma piu' in fretta di quanto avanza
+          const inSofferenza = avanzamento > 0 && avanzamento < 95
+                            && consumo > avanzamento + 10;
+
+          return {
+            p, acts, venduto, svolto, previsto, scarto, avanzamento,
+            consumo, proiezione, scartoFinale, inSofferenza,
+            discordanza: vendutoFasi > 0 && vendutoProgetto > 0
+                      && Math.abs(vendutoFasi - vendutoProgetto) > 0.01,
+            vendutoFasi, vendutoProgetto,
+          };
+        })
+        .filter(Boolean)
+        // Prima chi ha gia' sforato — li' si recuperano soldi — poi chi sta
+        // per sforare, che e' ancora in tempo per essere corretto.
+        .sort((a, b) => b.scartoFinale - a.scartoFinale || b.scarto - a.scarto);
+
+      // Un gruppo per progetto: il totale in intestazione, il dettaglio delle
+      // attivita' sotto. Cosi' la stampa e' gia' il documento da allegare a
+      // una richiesta di integrazione.
+      const groups = righe.map(r => ({
+        title: `${[countryFlag(r.p.country), r.p.code].filter(Boolean).join(' ')} ${r.p.name}`
+             + `  —  ${t('sold')} ${fmtDays(r.venduto, locale)}`
+             + ` · ${t('done')} ${fmtDays(r.svolto, locale)}`
+             // Residuo: positivo se restano giorni da fare, negativo se si e'
+             // gia' sforato. Prima qui c'era lo scarto con il segno opposto
+             // (svolto meno venduto): lo stesso dato compariva con due segni.
+             + ` · ${t('remaining')} ${fmtDays(r.venduto - r.svolto, locale)}`
+             + (r.scartoFinale > 0.01 && r.scarto <= 0.01
+                 ? `  ⚡ ${t('willExceed')} ${fmtDays(r.scartoFinale, locale)}` : '')
+             + (r.inSofferenza ? '  ⚠' : '')
+             + (r.discordanza ? '  ⚠' : ''),
+        headers: [t('activity'), t('sold'), t('planned'), t('done'), t('remaining'), t('progress'), t('period')],
+        rows: r.acts.map(a => {
+          const svoltoA = giorniUomo(a) * ((Number(a.progress) || 0) / 100);
+          // Il residuo ha senso solo per le attivita' vendute a fasi: senza
+          // un proprio venduto il riferimento e' il progetto, nel titolo
+          const vendutoA = Number(a.sold_days) || 0;
+          return [
+            a.name,
+            vendutoA ? fmtDays(vendutoA, locale) : '—',
+            fmtDays(giorniUomo(a), locale),
+            fmtDays(svoltoA, locale),
+            vendutoA ? fmtDays(vendutoA - svoltoA, locale) : '—',
+            (Number(a.progress) || 0) + '%',
+            formatActivityPeriod(a, locale, t('morning'), t('afternoon')),
+          ];
+        }),
+      }));
+
+      return {
+        groups,
+        flatHeaders: [t('project'), t('sold'), t('done'), t('planned'),
+                      t('remaining'), t('progress'), t('used'), t('atCompletion')],
+        flatRows: righe.map(r => [
+          `${r.p.code} - ${r.p.name}`,
+          fmtDays(r.venduto, locale),
+          fmtDays(r.svolto, locale),
+          fmtDays(r.previsto, locale),
+          fmtDays(r.venduto - r.svolto, locale),
+          Math.round(r.avanzamento) + '%',
+          Math.round(r.consumo) + '%' + (r.inSofferenza ? ' ⚠' : ''),
+          // Stesso segno del residuo: negativo se a fine lavori si sforera'
+          fmtDays(r.venduto - r.proiezione, locale),
+        ]),
+      };
+    }
+
+    // FABBISOGNO
+    // Attivita' con meno tecnici presenti di quelli richiesti, giorno per
+    // giorno: un'attivita' con Marco la prima settimana e Luca la seconda ha
+    // due nomi, ma ogni giorno una persona sola. Un tratto per riga, in
+    // ordine di data: le scoperture piu' vicine sono le prime da risolvere.
+    // Contano i giorni di calendario, come nel resto dell'applicazione e
+    // come nella griglia delle presenze: lo stesso giorno non deve risultare
+    // scoperto in un punto e coperto in un altro.
+    if (reportType === 'staffing') {
+      const tratti = [];
+      scoped.forEach(a => {
+        coverageGaps(a, from, to).forEach(g => tratti.push({ g, a, p: P(a.project_id) }));
+      });
+      tratti.sort((x, y) => x.g.from.localeCompare(y.g.from)
+        || (x.p?.code || '').localeCompare(y.p?.code || '')
+        || x.a.name.localeCompare(y.a.name));
+      return {
+        headers: [t('period'), t('project'), t('activity'), t('presentCount'), t('requiredCount'),
+                  t('daysCol'), t('missingManDays')],
+        rows: tratti.map(({ g, a, p }) => [
+          formatActivityPeriod({ start_date: g.from, end_date: g.to, day_part: dayPartOf(a) },
+                               locale, t('morning'), t('afternoon')),
+          p ? `${p.code} - ${p.name}` : '—',
+          a.name,
+          String(g.present),
+          String(g.required),
+          fmtDays(g.days, locale),
+          fmtDays(g.missing, locale),
+        ]),
+      };
+    }
+
     // 1. AGENDA TECNICO — dove va e quando
     if (reportType === 'agenda') {
       const groups = [];
@@ -331,9 +548,12 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
         ? technicians.filter(x => String(x.id) === String(techFilter))
         : technicians;
 
+      // Una riga per periodo del tecnico: chi lavora su un'attivita' in due
+      // momenti la vede due volte, ognuna con le sue date
+      const periodi = periodiIn(scoped);
       list.forEach(tech => {
-        const acts = scoped
-          .filter(a => techOf(a).some(x => x.id === tech.id))
+        const acts = periodi
+          .filter(v => v.technician.id === tech.id)
           .sort((a, b) => actStartUnit(a) - actStartUnit(b));
         if (!acts.length) return;
         groups.push({
@@ -357,22 +577,24 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
 
     // 2. CARICO PER TECNICO — saturazione sui giorni realmente disponibili
     if (reportType === 'workload') {
+      const periodi = periodiIn(scoped);
       const rows = technicians.map(tech => {
-        const acts = scoped.filter(a => techOf(a).some(x => x.id === tech.id));
-        const busy = acts.reduce((s, a) => s + daysInRange(a, from, to), 0);
+        const suoi = periodi.filter(v => v.technician.id === tech.id);
+        // Giorni occupati contati una volta sola: due impegni nello stesso
+        // giorno sono un conflitto, non due giorni di lavoro. Prima si
+        // sommavano, e il carico superava quello mostrato dal Gantt.
+        const busy = occupiedDays(suoi, from, to);
         // Le assenze riducono i giorni disponibili: senza, chi e' in ferie
         // meta' mese risulterebbe scarico invece che assente.
-        const off = absences
-          .filter(x => x.technician_id === tech.id)
-          .reduce((s, x) => s + daysInRange(x, from, to), 0);
+        const off = occupiedDays(absences.filter(x => x.technician_id === tech.id), from, to);
         const avail = Math.max(0, periodDays - off);
         const pct = avail ? Math.round((busy / avail) * 100) : 0;
         return {
           name: tech.name,
           home: tech.home_country || '',
-          nAct: acts.length,
+          nAct: new Set(suoi.map(v => v.activity.id)).size,
           busy, off, avail, pct,
-          projects: new Set(acts.map(a => a.project_id)).size,
+          projects: new Set(suoi.map(v => v.project_id)).size,
         };
       })
       .filter(r => r.nAct > 0 || r.off > 0 || !techFilter)
@@ -429,11 +651,15 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           const perTech = new Map();
           let tDone = 0, tPlanned = 0;
 
+          // Ogni periodo di ogni tecnico conta per le sue date. Un'attivita'
+          // senza tecnici conta come una persona, sotto la voce "—".
           acts.forEach(a => {
-            const s = splitDays(a, from, to, todayStr);
-            const list = techOf(a);
-            const names = list.length ? list.map(x => x.name) : ['—'];
-            names.forEach(n => {
+            const periodi = assignmentsOf(a);
+            const voci = periodi.length
+              ? periodi.map(v => [v.technician.name, v])
+              : [['—', a]];
+            voci.forEach(([n, x]) => {
+              const s = splitDays(x, from, to, todayStr);
               const e = perTech.get(n) || { done: 0, planned: 0 };
               e.done += s.done;
               e.planned += s.planned;
@@ -479,24 +705,24 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
 
     // 4. TRASFERTE — chi lavora fuori dalla propria nazione
     if (reportType === 'travel') {
+      // Una riga per periodo: la trasferta dura quanto il periodo del
+      // tecnico, non quanto l'attivita'
       const rows = [];
-      scoped.forEach(a => {
-        const p = P(a.project_id);
+      periodiIn(scoped).forEach(v => {
+        const p = P(v.project_id);
         if (!p?.country) return;
-        techOf(a).forEach(x => {
-          const full = technicians.find(y => y.id === x.id);
-          const home = full?.home_country;
-          if (!home || home === p.country) return;
-          rows.push([
-            full.name,
-            `${[countryFlag(home), home].filter(Boolean).join(' ')}`,
-            `${[countryFlag(p.country), p.country].filter(Boolean).join(' ')}`,
-            `${p.code} - ${p.name}`,
-            a.name,
-            formatActivityPeriod(a, locale, t('morning'), t('afternoon')),
-            fmtDays(daysInRange(a, from, to), locale),
-          ]);
-        });
+        const full = technicians.find(y => y.id === v.technician.id);
+        const home = full?.home_country;
+        if (!home || home === p.country) return;
+        rows.push([
+          full.name,
+          `${[countryFlag(home), home].filter(Boolean).join(' ')}`,
+          `${[countryFlag(p.country), p.country].filter(Boolean).join(' ')}`,
+          `${p.code} - ${p.name}`,
+          v.name,
+          formatActivityPeriod(v, locale, t('morning'), t('afternoon')),
+          fmtDays(daysInRange(v, from, to), locale),
+        ]);
       });
       rows.sort((a, b) => a[0].localeCompare(b[0]));
       return {
@@ -515,10 +741,18 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
         const e = m.get(cc);
         e.projects.add(a.project_id);
         e.acts += 1;
-        const d = daysInRange(a, from, to);
-        const list = techOf(a);
-        e.days += d * (list.length || 1);
-        list.forEach(x => e.techs.add(x.id));
+        // Giorni uomo: la parte di ogni periodo che cade nel report.
+        // Un'attivita' senza tecnici conta come una persona.
+        const periodi = assignmentsOf(a);
+        if (periodi.length) {
+          periodi.forEach(v => {
+            const d = daysInRange(v, from, to);
+            e.days += d;
+            if (d > 0) e.techs.add(v.technician.id);
+          });
+        } else {
+          e.days += daysInRange(a, from, to);
+        }
       });
       const rows = [...m.entries()]
         .sort((a, b) => b[1].days - a[1].days)
@@ -569,7 +803,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
 
     return { headers: [], rows: [] };
   }, [reportType, scoped, technicians, projects, projectsById, from, to, techFilter,
-      countryFilter, projectFilter, locale, t, periodDays, activities, absences, from, to, skillFilter]);
+      countryFilter, projectFilter, locale, t, periodDays, activities, absences, from, to, skillFilter, projects]);
 
   const currentLabel = t(REPORT_TYPES.find(r => r.id === reportType).labelKey);
   const subtitle = reportType === 'today'
@@ -587,8 +821,8 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
     else downloadCSV(`${reportType}_${stamp}.csv`, data.headers, data.rows);
   };
 
-  const isEmpty = data.todayGroups ? data.todayGroups.length === 0
-    : data.groups ? data.groups.length === 0 : data.rows.length === 0;
+  const isEmpty = periodoRovesciato || (data.todayGroups ? data.todayGroups.length === 0
+    : data.groups ? data.groups.length === 0 : data.rows.length === 0);
 
   const presets = useMemo(() => [
     { key: 'thisMonth', range: () => {
@@ -759,7 +993,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
         ) : (
           <>
             <label style={{ fontSize: 13, color: 'var(--muted)' }}>{t('from')}</label>
-            <input type="date" value={from} onChange={e => setFrom(e.target.value)} style={inputStyle} />
+            <input type="date" value={from} onChange={e => cambiaInizio(e.target.value)} style={inputStyle} />
             <label style={{ fontSize: 13, color: 'var(--muted)' }}>{t('to')}</label>
             <input type="date" value={to} onChange={e => setTo(e.target.value)} style={inputStyle} />
           </>
@@ -819,9 +1053,13 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
       </div>
 
       {/* Anteprima */}
-      {isEmpty ? (
+      {periodoRovesciato ? (
+        <div style={{ padding: '2rem', textAlign: 'center', color: '#ef4444', fontSize: 14 }}>
+          ⚠ {t('invertedPeriod')}
+        </div>
+      ) : isEmpty ? (
         <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--muted)', fontSize: 14 }}>
-          {t('noDataPeriod')}
+          {reportType === 'staffing' ? t('staffingAllCovered') : t('noDataPeriod')}
         </div>
       ) : (
         <div style={{ maxHeight: 'calc(100vh - 340px)', overflow: 'auto', border: '1px solid var(--border)', borderRadius: 8 }}>
@@ -844,7 +1082,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
                 }}>
                   {g.title}
                 </div>
-                <Table headers={g.headers} rows={g.rows} />
+                <Table headers={g.headers} rows={g.rows} allRows={data.groups.flatMap(x => x.rows)} />
               </div>
             ))
           ) : (
@@ -891,8 +1129,10 @@ const TodayList = ({ groups, expanded, onToggle, onActivityClick, t }) => {
                 <span style={{ color: tone(g.status), fontSize: 12 }}>{g.label}</span>
               ) : many ? (
                 <span style={{ color: 'var(--muted)', fontSize: 12 }}>
-                  {g.items.length} {t('activitiesCol').toLowerCase()} —{' '}
-                  {g.items.map(i => i.code).join(', ')}
+                  {/* Codici senza ripetizioni: due attivita' dello stesso
+                      progetto davano "PROVA-01, PROVA-01" */}
+                  {g.items.length} {t(g.items.length === 1 ? 'activityCount1' : 'activityCount')} —{' '}
+                  {[...new Set(g.items.map(i => i.code))].join(', ')}
                 </span>
               ) : (
                 <span
@@ -911,6 +1151,10 @@ const TodayList = ({ groups, expanded, onToggle, onActivityClick, t }) => {
                   <span style={{ color: 'var(--muted)' }}>{g.items[0].country} {g.items[0].code}</span>
                   {' · '}{g.items[0].activity}
                 </span>
+              )}
+              {/* Al lavoro per una parte della giornata, assente per l'altra */}
+              {g.items.length > 0 && g.note && (
+                <span style={{ color: '#f59e0b', fontSize: 12 }}>· 🏖 {g.note}</span>
               )}
             </div>
 
@@ -944,9 +1188,12 @@ const TodayList = ({ groups, expanded, onToggle, onActivityClick, t }) => {
   );
 };
 
-const Table = ({ headers, rows, sticky }) => {
-  const num = numericColumns(rows);
-  const widths = columnWidths(headers, num);
+// allRows: le righe di tutti i gruppi del report, per larghezze uguali in
+// ogni gruppo. Senza, si usano quelle della tabella stessa.
+const Table = ({ headers, rows, sticky, allRows }) => {
+  const misura = allRows || rows;
+  const num = numericColumns(misura);
+  const widths = columnWidths(headers, num, misura);
   return (
     <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, tableLayout: 'fixed' }}>
       <colgroup>
