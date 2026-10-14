@@ -6,58 +6,58 @@
 // insieme, con il mouse o con il dito. L'ultima riga confronta i presenti
 // con i tecnici richiesti.
 //
+// Dalla 1.2.0 i giorni di riposo dell'attivita' (fine settimana, festivi,
+// giorni fuori dalla sua settimana lavorativa) restano spenti anche dentro
+// un periodo: si accendono uno per uno quando si lavora davvero. Un
+// trascinamento cominciato su un giorno lavorativo cambia solo i giorni
+// lavorativi, cosi' attraversando un fine settimana non lo si accende per
+// sbaglio; cominciato su un giorno di riposo cambia solo i giorni di riposo.
+//
 // Oltre ai giorni di lavoro mostra cio' che serve per decidere: le assenze
-// del tecnico (tratteggiate, anche a mezza giornata) e i giorni in cui e'
-// gia' impegnato su altre attivita' (punto rosso).
+// del tecnico (tratteggiate, anche a mezza giornata), che tolgono quei
+// giorni dal conto, e i giorni in cui e' gia' impegnato su altre attivita'
+// (punto rosso).
 //
 // Durante il trascinamento lo stato resta qui, in locale, e passa alla
 // finestra solo quando si rilascia: aggiornare l'intera applicazione a ogni
 // casella attraversata renderebbe il trascinamento lento con molti dati.
 // ---------------------------------------------------------------------------
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { halfUnit, actStartUnit, actEndUnit, dayPartOf, activitiesOverlap } from './dateUtils.js';
-import { dayList, periodsToDays, daysToPeriods } from './planning.js';
+import { dayPartOf, isoDay } from './dateUtils.js';
+import {
+  dayList, periodsToDays, daysToPeriods, workedDayList, workedRuns, morningUnit, NO_CALENDAR,
+} from './planning.js';
 
 const CELLA = 24;
 const MAX_GIORNI = 370;
 const TUTTA = [{ start_date: null, end_date: null }];
 
+// Mezze giornate di una fascia: 0 la mattina, 1 il pomeriggio
+const mezzeDi = (dp) => (dp === 'AM' ? [0] : dp === 'PM' ? [1] : [0, 1]);
+
 // Mezze giornate di un giorno coperte da un'assenza: 'AM', 'PM' o entrambe
 const metaAssenti = (assenze, giorno) => {
-  const u0 = halfUnit(giorno, 'AM', false);
-  const u1 = halfUnit(giorno, 'PM', true);
   const mezze = new Set();
   assenze.forEach(x => {
+    const da = isoDay(x.start_date);
+    const a = isoDay(x.end_date);
+    if (giorno < da || giorno > a) return;
     const dp = dayPartOf(x);
-    [u0, u1].forEach(u => {
-      if (actStartUnit(x) <= u && u <= actEndUnit(x)
-          && (dp === 'FULL' || (dp === 'AM' && u % 2 === 0) || (dp === 'PM' && u % 2 === 1))) {
-        mezze.add(u === u0 ? 'AM' : 'PM');
-      }
-    });
+    if (dp !== 'PM') mezze.add('AM');
+    if (dp !== 'AM') mezze.add('PM');
   });
   return mezze;
 };
 
-// Tratti consecutivi di un elenco ordinato di giorni, per i riepiloghi
-const tratti = (giorni) => {
-  const out = [];
-  giorni.forEach(g => {
-    const ultimo = out[out.length - 1];
-    const prima = ultimo && new Date(ultimo.to + 'T00:00:00Z');
-    if (prima) prima.setUTCDate(prima.getUTCDate() + 1);
-    if (ultimo && prima.toISOString().slice(0, 10) === g) ultimo.to = g;
-    else out.push({ from: g, to: g });
-  });
-  return out;
-};
-
 const AssignmentGrid = ({
   from, to, dayPart, technicians, periods, onChange,
-  required, onRequiredChange, absences, otherViews, dayKind, locale, t,
+  required, onRequiredChange, absences, otherViews, dayKind, isRest, calendar, locale, t,
 }) => {
   const giorni = useMemo(() => dayList(from, to), [from, to]);
   const troppiGiorni = giorni.length > MAX_GIORNI;
+  const riposo = isRest || null;
+  const cal = calendar || NO_CALENDAR;
+  const mezze = mezzeDi(dayPart);
 
   // Copia locale dei periodi, allineata a quelli della finestra
   const [bozza, setBozza] = useState(periods);
@@ -66,39 +66,54 @@ const AssignmentGrid = ({
   const bozzaRef = useRef(bozza);
   bozzaRef.current = bozza;
 
-  const giorniDi = (id, fonte = bozza) => periodsToDays(fonte[id] || TUTTA, from, to);
+  const giorniDi = (id, fonte = bozza) => periodsToDays(fonte[id] || TUTTA, from, to, riposo);
+
+  // Giorni lavorati dell'attivita' (la stessa regola dei periodi): sono
+  // quelli in cui si controlla la copertura
+  const giorniAttivita = useMemo(
+    () => new Set(troppiGiorni ? [] : workedDayList(from, to, riposo)),
+    [from, to, riposo, troppiGiorni]);
+  // Insieme di "tutta la durata", per il riepilogo
+  const tutti = giorniAttivita;
 
   const breve = (g) => new Date(g + 'T00:00:00').toLocaleDateString(locale, { day: '2-digit', month: '2-digit' });
   const intervallo = (x) => (x.from === x.to ? breve(x.from) : `${breve(x.from)} → ${breve(x.to)}`);
+  const tratti = (lista) => workedRuns(lista, riposo).map(intervallo).join(', ');
 
-  // Per ogni tecnico: assenze e impegni altrove, giorno per giorno
+  // Per ogni tecnico: assenze e impegni altrove, giorno per giorno.
+  // Gli impegni altrove contano solo nei giorni in cui quell'altra attivita'
+  // si lavora davvero: un fine settimana di riposo non e' "impegnato".
   const contesto = useMemo(() => {
     const m = new Map();
     if (troppiGiorni) return m;
     technicians.forEach(tc => {
       const sue = (absences || []).filter(x => x.technician_id === tc.id);
-      const viste = (otherViews && otherViews.get(tc.id)) || [];
+      const viste = ((otherViews && otherViews.get(tc.id)) || []).map(v => ({ v, u: cal.viewUnits(v) }));
       const perGiorno = new Map();
       giorni.forEach(g => {
         const assente = sue.length ? metaAssenti(sue, g) : new Set();
-        const qui = { start_date: g, end_date: g, day_part: dayPart };
-        const altrove = viste.filter(v => activitiesOverlap(qui, v)).map(v => v.name);
+        const u = morningUnit(g);
+        const altrove = viste.filter(x => mezze.some(h => x.u.has(u + h))).map(x => x.v.name);
         if (assente.size || altrove.length) perGiorno.set(g, { assente, altrove });
       });
       m.set(tc.id, perGiorno);
     });
     return m;
-  }, [technicians, absences, otherViews, giorni, dayPart, troppiGiorni]);
+  // mezze dipende solo da dayPart, gia' fra le dipendenze
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [technicians, absences, otherViews, giorni, dayPart, troppiGiorni, cal]);
 
   // Trascinamento: si dipinge sempre lo stato opposto a quello della prima
-  // casella toccata, e solo sulla riga di partenza
+  // casella toccata, solo sulla riga di partenza e solo sui giorni dello
+  // stesso tipo (lavorativi o di riposo) della prima casella
+  const diRiposo = (g) => Boolean(riposo && riposo(g));
   const applica = (id, giorno) => {
     const p = pittura.current;
-    if (!p || p.id !== id) return;
+    if (!p || p.id !== id || diRiposo(giorno) !== p.riposo) return;
     const correnti = giorniDi(id, bozzaRef.current);
     if (correnti.has(giorno) === p.accendi) return;
     if (p.accendi) correnti.add(giorno); else correnti.delete(giorno);
-    setBozza(b => ({ ...b, [id]: daysToPeriods(correnti, from, to) }));
+    setBozza(b => ({ ...b, [id]: daysToPeriods(correnti, from, to, riposo) }));
   };
   const cellaSotto = (e) => {
     const el = document.elementFromPoint(e.clientX, e.clientY);
@@ -109,7 +124,7 @@ const AssignmentGrid = ({
     const c = cellaSotto(e);
     if (!c) return;
     e.preventDefault();
-    pittura.current = { id: c.id, accendi: !giorniDi(c.id).has(c.giorno) };
+    pittura.current = { id: c.id, accendi: !giorniDi(c.id).has(c.giorno), riposo: diRiposo(c.giorno) };
     applica(c.id, c.giorno);
   };
   const muovi = (e) => {
@@ -135,9 +150,19 @@ const AssignmentGrid = ({
   const richiesti = Number(required) || 0;
   const presenzePerTecnico = troppiGiorni ? new Map()
     : new Map(technicians.map(tc => [tc.id, giorniDi(tc.id)]));
-  const copertura = giorni.map(g =>
-    technicians.filter(tc => presenzePerTecnico.get(tc.id)?.has(g)).length);
-  const scoperti = richiesti ? giorni.filter((g, i) => copertura[i] < richiesti) : [];
+
+  // Presenza di un tecnico in un giorno: 1 se lavora, 0,5 se un'assenza gli
+  // toglie meta' della fascia, 0 se non lavora o e' assente
+  const presenza = (tc, g) => {
+    if (!presenzePerTecnico.get(tc.id)?.has(g)) return 0;
+    const ass = contesto.get(tc.id)?.get(g)?.assente;
+    if (!ass || !ass.size) return 1;
+    const libere = mezze.filter(h => !ass.has(h === 0 ? 'AM' : 'PM')).length;
+    return libere / mezze.length;
+  };
+  const copertura = giorni.map(g => technicians.reduce((s, tc) => s + presenza(tc, g), 0));
+  const scoperti = richiesti ? giorni.filter((g, i) => giorniAttivita.has(g) && copertura[i] < richiesti) : [];
+  const numero = (n) => Number(n).toLocaleString(locale, { maximumFractionDigits: 1 });
 
   const etichetta = { display: 'block', marginBottom: '0.5rem', fontWeight: '600' };
   const nota = { color: 'var(--muted)', fontSize: 13, margin: '0.25rem 0 0' };
@@ -181,7 +206,7 @@ const AssignmentGrid = ({
                   <th style={{ position: 'sticky', left: 0, background: 'var(--surface)', zIndex: 2 }} />
                   {giorni.map((g, i) => {
                     const d = new Date(g + 'T00:00:00');
-                    const tipo = dayKind(g);
+                    const tipo = dayKind ? dayKind(g) : null;
                     return (
                       <th key={g} title={d.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long' })}
                         style={{
@@ -218,16 +243,18 @@ const AssignmentGrid = ({
                       </td>
                       {giorni.map(g => {
                         const acceso = presenti.has(g);
-                        const tipo = dayKind(g);
+                        const tipo = dayKind ? dayKind(g) : null;
+                        const riposa = diRiposo(g);
                         const x = info.get(g);
                         const assente = x ? x.assente : null;
                         const altrove = x ? x.altrove : [];
+                        // Il riposo si vede anche quando il festivo e' lavorabile
                         const sfondo = acceso ? (tc.color || 'var(--accent)')
                           : tipo === 'holiday' ? 'rgba(239,68,68,0.10)'
-                          : tipo === 'rest' ? 'rgba(128,128,128,0.12)' : 'var(--surface2)';
+                          : (tipo === 'rest' || riposa) ? 'rgba(128,128,128,0.12)' : 'var(--surface2)';
                         const descrizione = [
                           `${tc.name} — ${new Date(g + 'T00:00:00').toLocaleDateString(locale, { weekday: 'short', day: '2-digit', month: '2-digit' })}`,
-                          acceso ? t('presentLegend') : t('notPresent'),
+                          acceso ? t('presentLegend') : riposa ? t('restLegend') : t('notPresent'),
                           assente && assente.size ? `${t('absentLegend')}${assente.size === 1 ? ` (${assente.has('AM') ? t('morning') : t('afternoon')})` : ''}` : null,
                           altrove.length ? `${t('busyElsewhere')}: ${altrove.join(', ')}` : null,
                         ].filter(Boolean).join(' · ');
@@ -238,8 +265,9 @@ const AssignmentGrid = ({
                               title={descrizione}
                               style={{
                                 width: CELLA, height: 22, borderRadius: 4, position: 'relative',
-                                background: sfondo, opacity: acceso && tipo ? 0.75 : 1,
-                                border: '1px solid var(--border)', boxSizing: 'border-box',
+                                background: sfondo,
+                                border: acceso && riposa ? '2px solid var(--fg)' : '1px solid var(--border)',
+                                boxSizing: 'border-box',
                                 cursor: 'pointer', userSelect: 'none', touchAction: 'none',
                               }}
                             >
@@ -248,7 +276,7 @@ const AssignmentGrid = ({
                                   position: 'absolute', top: 0, bottom: 0, borderRadius: 3, pointerEvents: 'none',
                                   left: assente.size === 1 && assente.has('PM') ? '50%' : 0,
                                   right: assente.size === 1 && assente.has('AM') ? '50%' : 0,
-                                  background: 'repeating-linear-gradient(45deg, rgba(245,158,11,0.7) 0 2px, transparent 2px 5px)',
+                                  background: 'repeating-linear-gradient(45deg, rgba(245,158,11,0.85) 0 2px, transparent 2px 5px)',
                                 }} />
                               )}
                               {altrove.length > 0 && (
@@ -270,14 +298,19 @@ const AssignmentGrid = ({
                     padding: '0 8px 0 4px', fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap',
                   }}>{t('coverage')}</td>
                   {copertura.map((n, i) => {
-                    const manca = richiesti && n < richiesti;
+                    const g = giorni[i];
+                    // Nei giorni di riposo la copertura non si controlla: si
+                    // mostra solo chi lavora, senza colore
+                    const controllato = giorniAttivita.has(g);
+                    const manca = controllato && richiesti && n < richiesti;
                     return (
-                      <td key={giorni[i]}>
+                      <td key={g}>
                         <div style={{
                           width: CELLA, height: 18, lineHeight: '18px', borderRadius: 4, textAlign: 'center',
-                          background: manca ? 'rgba(239,68,68,0.15)' : 'rgba(22,163,74,0.12)',
-                          color: manca ? '#ef4444' : '#16a34a', fontSize: 11,
-                        }}>{richiesti ? `${n}` : n}</div>
+                          background: !controllato ? 'transparent'
+                            : manca ? 'rgba(239,68,68,0.15)' : 'rgba(22,163,74,0.12)',
+                          color: !controllato ? 'var(--muted)' : manca ? '#ef4444' : '#16a34a', fontSize: 11,
+                        }}>{controllato || n ? numero(n) : ''}</div>
                       </td>
                     );
                   })}
@@ -288,6 +321,11 @@ const AssignmentGrid = ({
 
           <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: 'var(--muted)', marginTop: 6 }}>
             <span>{t('gridHint')}</span>
+            <span>
+              <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, verticalAlign: -1,
+                background: 'rgba(128,128,128,0.25)', border: '1px solid var(--border)' }} />
+              {' '}{t('restLegend')}
+            </span>
             <span>
               <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, verticalAlign: -1,
                 background: 'repeating-linear-gradient(45deg, rgba(245,158,11,0.8) 0 2px, transparent 2px 4px)' }} />
@@ -303,27 +341,33 @@ const AssignmentGrid = ({
             {technicians.map(tc => {
               const presenti = presenzePerTecnico.get(tc.id);
               const lista = giorni.filter(g => presenti.has(g));
+              const intera = lista.length === tutti.size && lista.every(g => tutti.has(g));
               const testo = !lista.length ? t('noDaysRemoved')
-                : lista.length === giorni.length ? t('wholeDuration')
-                : tratti(lista).map(intervallo).join(', ');
+                : intera ? t('wholeDuration')
+                : tratti(lista);
+              // Giorni di riposo lavorati: si scrivono a parte, perche' sono
+              // l'eccezione da notare
+              const extra = lista.filter(g => diRiposo(g));
               return (
                 <div key={tc.id}>
                   <strong>{tc.name}</strong>
                   <span style={{ color: lista.length ? 'var(--muted)' : '#ef4444' }}> — {testo}</span>
+                  {!intera && extra.length > 0 && (
+                    <span style={{ color: 'var(--muted)' }}> · {t('restWorked')}: {extra.map(breve).join(', ')}</span>
+                  )}
                 </div>
               );
             })}
             <div style={{ marginTop: 4, color: richiesti ? (scoperti.length ? '#ef4444' : '#16a34a') : 'var(--muted)' }}>
               {!richiesti ? t('noRequirement')
-                : scoperti.length ? `${t('uncoveredDays')}: ${tratti(scoperti).map(intervallo).join(', ')}`
+                : scoperti.length ? `${t('uncoveredDays')}: ${tratti(scoperti)}`
                 : t('coverageComplete')}
             </div>
             {(() => {
               const conflitti = technicians.map(tc => {
-                const presenti = presenzePerTecnico.get(tc.id);
                 const info = contesto.get(tc.id) || new Map();
-                const giorniConflitto = giorni.filter(g => presenti.has(g) && (info.get(g)?.altrove.length));
-                return giorniConflitto.length ? `${tc.name} ${tratti(giorniConflitto).map(intervallo).join(', ')}` : null;
+                const giorniConflitto = giorni.filter(g => presenza(tc, g) > 0 && (info.get(g)?.altrove.length));
+                return giorniConflitto.length ? `${tc.name} ${tratti(giorniConflitto)}` : null;
               }).filter(Boolean);
               return conflitti.length ? (
                 <div style={{ color: '#ef4444' }}>⚠ {t('conflictWithOthers')}: {conflitti.join('; ')}</div>

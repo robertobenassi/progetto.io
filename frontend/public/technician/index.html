@@ -243,8 +243,26 @@ function render(offline) {
     // Ogni voce dell'agenda è un periodo del tecnico (start_date/end_date sono
     // le sue date, non quelle dell'attività): se lavora su un'attività in due
     // momenti diversi, compare in due voci. La fascia vale per ogni giorno.
-    const att = (dati.activities || []).filter(a => iso(a.start_date) <= g && g <= iso(a.end_date));
     const ass = (dati.absences  || []).filter(a => startU(a) <= u1 && endU(a) >= u0);
+    // Mezze giornate coperte dalle assenze di questo giorno
+    const mezzeAssenti = new Set();
+    ass.forEach(x => {
+      if (startU(x) <= u0 && endU(x) >= u0) mezzeAssenti.add('AM');
+      if (startU(x) <= u1 && endU(x) >= u1) mezzeAssenti.add('PM');
+    });
+    // Dalla 1.2.0 il server manda i giorni lavorati di ogni periodo: nei
+    // giorni di riposo (fine settimana, festivi) l'attività non compare, a
+    // meno che quel giorno non sia stato segnato come lavorato. Senza
+    // l'elenco (server precedente) vale l'intervallo, come prima.
+    // Un'assenza che copre tutta la fascia dell'attività toglie il giorno:
+    // resta la sola scheda dell'assenza.
+    const att = (dati.activities || []).filter(a => {
+      const lavora = Array.isArray(a.days) ? a.days.includes(g) : (iso(a.start_date) <= g && g <= iso(a.end_date));
+      if (!lavora) return false;
+      const f = fasciaDi(a);
+      const mezze = f === 'AM' ? ['AM'] : f === 'PM' ? ['PM'] : ['AM', 'PM'];
+      return !mezze.every(h => mezzeAssenti.has(h));
+    });
     if (!att.length && !ass.length) return;
     vuoto = false;
 
@@ -273,7 +291,8 @@ function render(offline) {
       // periodi compare una volta sola.
       const colleghi = [];
       (a.mates || []).forEach(m => {
-        const presente = !m.start_date || (iso(m.start_date) <= g && g <= iso(m.end_date));
+        const presente = Array.isArray(m.days) ? m.days.includes(g)
+          : (!m.start_date || (iso(m.start_date) <= g && g <= iso(m.end_date)));
         if (presente && !colleghi.some(x => x.name === m.name)) colleghi.push(m);
       });
       const altroPeriodo = a.activity_start_date && a.activity_end_date

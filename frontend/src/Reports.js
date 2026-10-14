@@ -1,11 +1,17 @@
 import React, { useState, useMemo, useRef } from 'react';
 import {
-  actDurationDays, daysInRange, overlapsRange, actStartUnit, actEndUnit, splitDays, halfUnit,
+  overlapsRange, actStartUnit, actEndUnit, halfUnit,
   formatActivityPeriod, fmtDays, countryFlag, toInputDate, dayPartOf,
 } from './dateUtils';
 // I report ragionano per periodo di assegnazione: un tecnico puo' lavorare
-// solo su una parte di un'attivita', anche in piu' periodi separati
-import { assignmentsOf, occupiedDays, coverageGaps } from './planning.js';
+// solo su una parte di un'attivita', anche in piu' periodi separati.
+// Dalla 1.2.0 contano i GIORNI LAVORATI, decisi dal calendario: riposi e
+// festivi della nazione del progetto, settimana lavorativa dell'attivita',
+// giorni di riposo lavorati segnati a parte, assenze dei tecnici.
+import {
+  assignmentsOf, occupiedDays, coverageGaps, countDays, splitDone,
+  activityManDays, activityManDaysSplit, NO_CALENDAR,
+} from './planning.js';
 
 // Quali colonne sono numeriche, dedotto dai dati.
 // La regola precedente ("le ultime due a destra") era arbitraria: in Giorni uomo
@@ -153,7 +159,9 @@ const REPORT_TYPES = [
   { id: 'soldvsdone', labelKey: 'repSoldVsDone' },
 ];
 
-function Reports({ projects, activities, technicians, absences = [], t, locale, onActivityClick, canEdit, showArchived, onToggleArchived }) {
+function Reports({ projects, activities, technicians, absences = [], calendar, t, locale, onActivityClick, canEdit, showArchived, onToggleArchived }) {
+  // Calendario di lavoro costruito da App.js; senza, ogni giorno e' lavorato
+  const cal = calendar || NO_CALENDAR;
   const today = new Date();
   const [reportType, setReportType] = useState('agenda');
   const [from, setFrom] = useState(toInputDate(new Date(today.getFullYear(), today.getMonth(), 1)));
@@ -230,7 +238,12 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
     const techOf = (a) => a.technicians || [];
     // Periodi dei tecnici nelle attivita' indicate che toccano il periodo del
     // report. Ogni periodo ha le date del tecnico; .activity e' l'originale.
-    const periodiIn = (acts) => acts.flatMap(assignmentsOf).filter(v => overlapsRange(v, from, to));
+    // Solo i periodi con almeno un giorno pianificato nel report: un periodo
+    // che nel report cade tutto in un fine settimana di riposo non conta.
+    const periodiIn = (acts) => acts.flatMap(assignmentsOf)
+      .filter(v => overlapsRange(v, from, to) && countDays(cal.plannedUnits(v), from, to) > 0);
+    // Giorni lavorati di un periodo nel report
+    const lavorati = (v) => countDays(cal.viewUnits(v), from, to);
     const passaFiltri = (a) => {
       if (projectFilter && String(a.project_id) !== String(projectFilter)) return false;
       if (countryFilter) {
@@ -265,9 +278,10 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
       technicians
         .filter(tech => !techFilter || String(tech.id) === String(techFilter))
         .forEach(tech => {
-          // Periodi del tecnico che toccano quella data (non l'attivita' intera)
+          // Periodi del tecnico pianificati quel giorno (non l'attivita'
+          // intera): un sabato di riposo dentro un periodo non e' un impegno
           const impegni = periodi.filter(v => v.technician.id === tech.id
-            && metaCoperte(v, u0, u1).length > 0);
+            && (cal.plannedUnits(v).has(u0) || cal.plannedUnits(v).has(u1)));
           const abs = absences.filter(x =>
             x.technician_id === tech.id && metaCoperte(x, u0, u1).length > 0);
 
@@ -281,7 +295,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           // un'assenza qualsiasi per mostrare il tecnico come assente tutto
           // il giorno.
           const metaAssente = new Set(abs.flatMap(x => metaCoperte(x, u0, u1)));
-          const lavora = impegni.some(v => metaCoperte(v, u0, u1).some(u => !metaAssente.has(u)));
+          const lavora = impegni.some(v => [u0, u1].some(u => cal.plannedUnits(v).has(u) && !metaAssente.has(u)));
           const notaAssenza = abs.length
             ? `${t('abs_' + abs[0].type)}${metaAssente.size === 1
                 ? ` (${metaAssente.has(u0) ? t('morning') : t('afternoon')})` : ''}`
@@ -346,12 +360,18 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
             x.technician_id === tech.id && actStartUnit(x) <= u1 && actEndUnit(x) >= u0
           );
 
-          // Giorni gia' occupati nel periodo richiesto, contati una volta sola:
-          // con due impegni nello stesso giorno, o un impegno durante
-          // un'assenza, la somma superava i giorni del periodo.
-          const occupati = occupiedDays([...impegni, ...assenze], from, to);
-          const liberi = Math.max(0, periodDays - occupati);
-          const nAttivita = new Set(impegni.map(v => v.activity.id)).size;
+          // Giorni liberi: i giorni lavorativi del tecnico (nazione di base)
+          // in cui non lavora e non e' assente. Un impegno di sabato non
+          // toglie disponibilita', perche' il sabato non era disponibile.
+          const occupate = new Set();
+          impegni.forEach(v => cal.viewUnits(v).forEach(u => occupate.add(u)));
+          assenze.forEach(x => cal.absenceUnits(x).forEach(u => occupate.add(u)));
+          let mezzeLibere = 0;
+          cal.techAvailableUnits(tech.id, from, to).forEach(u => { if (!occupate.has(u)) mezzeLibere++; });
+          const liberi = mezzeLibere / 2;
+          const occupati = countDays(occupate, from, to);
+          const nAttivita = new Set(impegni.filter(v => countDays(cal.viewUnits(v), from, to) > 0)
+            .map(v => v.activity.id)).size;
 
           // Nazioni dove ha lavorato negli ultimi mesi: chi conosce gia' il
           // posto e' il candidato migliore a parita' di disponibilita'.
@@ -359,7 +379,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
             .map(v => projectsById.get(v.project_id)?.country)
             .filter(Boolean))];
 
-          const stato = assenze.length ? 'absent' : impegni.length ? 'partial' : 'free';
+          const stato = assenze.length ? 'absent' : nAttivita ? 'partial' : 'free';
           return { tech, stato, liberi, occupati, impegni, nAttivita, assenze, recenti };
         })
         // Prima chi e' del tutto libero, poi chi lo e' in parte, infine gli
@@ -397,21 +417,28 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
     // per chiedere un'integrazione bisogna poterla documentare, quindi non
     // basta il totale, servono le attivita' che lo compongono.
     if (reportType === 'soldvsdone') {
-      // Giorni uomo pianificati di un'attivita': la durata di ogni periodo di
-      // ogni tecnico. Senza tecnici conta come una persona, come nel report
-      // Giorni uomo. Prima si usava la durata dell'attivita': cinque giorni
-      // con due tecnici valevano 5 qui e 10 in Giorni uomo.
-      const giorniUomo = (a) => {
-        const periodi = assignmentsOf(a);
-        return periodi.length
-          ? periodi.reduce((s, v) => s + actDurationDays(v), 0)
-          : actDurationDays(a);
-      };
+      // Il confronto riguarda sempre l'INTERO progetto, alla data di oggi: il
+      // venduto e' del progetto, non di un mese. Il periodo del report non
+      // conta, e la pagina nasconde le date.
+      //
+      // Previsto: giorni uomo pianificati, lo stesso calcolo del report
+      // Giorni uomo (giorni lavorati di ogni periodo di ogni tecnico, meno
+      // le assenze; un'attivita' senza tecnici conta i tecnici richiesti).
+      // Svolto: la parte del previsto gia' trascorsa, fino a ieri.
+      // Progresso: l'avanzamento dichiarato a mano, che resta un dato a
+      // parte. Confrontato con lo svolto dice se si consumano giorni piu' in
+      // fretta di quanto avanza il lavoro.
+      const oggi = toInputDate(new Date());
+      const giorniUomo = (a) => activityManDays(a, cal);
+      const svoltoDi = (a) => activityManDaysSplit(a, cal, null, null, oggi).done;
+      const perInizio = (x, y) => String(x.start_date).localeCompare(String(y.start_date))
+        || x.name.localeCompare(y.name);
       const righe = projects
         .filter(p => !countryFilter || p.country === countryFilter)
         .filter(p => !projectFilter || String(p.id) === String(projectFilter))
         .map(p => {
-          const acts = (activities || []).filter(a => a.project_id === p.id);
+          // In ordine di data, come nel Gantt
+          const acts = (activities || []).filter(a => a.project_id === p.id).sort(perInizio);
 
           // Si vende in due modi: a fasi, oppure un pacchetto unico. Se le
           // attivita' portano un valore, quella e' la ripartizione reale.
@@ -420,14 +447,14 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           const venduto = vendutoFasi > 0 ? vendutoFasi : vendutoProgetto;
           if (!venduto) return null;          // senza un valore non c'e' confronto
 
-          // Svolto: giorni uomo delle attivita' completate, mezze giornate
-          // contate per meta'. Il parziale segue l'avanzamento dichiarato.
-          const svolto = acts.reduce((s, a) =>
-            s + giorniUomo(a) * ((Number(a.progress) || 0) / 100), 0);
+          const svolto = acts.reduce((s, a) => s + svoltoDi(a), 0);
           const previsto = acts.reduce((s, a) => s + giorniUomo(a), 0);
 
           const scarto = svolto - venduto;
-          const avanzamento = previsto > 0 ? (svolto / previsto) * 100 : 0;
+          // Avanzamento dichiarato, pesato sui giorni previsti di ogni fase
+          const avanzamento = previsto > 0
+            ? acts.reduce((s, a) => s + giorniUomo(a) * (Number(a.progress) || 0), 0) / previsto
+            : 0;
 
           // Quanto del venduto e' gia' stato consumato. Confrontato con
           // l'avanzamento dice se il progetto sta per sforare: al 40% di
@@ -475,7 +502,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
              + (r.discordanza ? '  ⚠' : ''),
         headers: [t('activity'), t('sold'), t('planned'), t('done'), t('remaining'), t('progress'), t('period')],
         rows: r.acts.map(a => {
-          const svoltoA = giorniUomo(a) * ((Number(a.progress) || 0) / 100);
+          const svoltoA = svoltoDi(a);
           // Il residuo ha senso solo per le attivita' vendute a fasi: senza
           // un proprio venduto il riferimento e' il progetto, nel titolo
           const vendutoA = Number(a.sold_days) || 0;
@@ -514,13 +541,14 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
     // giorno: un'attivita' con Marco la prima settimana e Luca la seconda ha
     // due nomi, ma ogni giorno una persona sola. Un tratto per riga, in
     // ordine di data: le scoperture piu' vicine sono le prime da risolvere.
-    // Contano i giorni di calendario, come nel resto dell'applicazione e
-    // come nella griglia delle presenze: lo stesso giorno non deve risultare
-    // scoperto in un punto e coperto in un altro.
+    // Contano i giorni lavorati dell'attivita', come nella griglia delle
+    // presenze: lo stesso giorno non deve risultare scoperto in un punto e
+    // coperto in un altro. Nei riposi non manca nessuno; chi e' assente non
+    // e' presente, e con mezza giornata di permesso conta per meta'.
     if (reportType === 'staffing') {
       const tratti = [];
       scoped.forEach(a => {
-        coverageGaps(a, from, to).forEach(g => tratti.push({ g, a, p: P(a.project_id) }));
+        coverageGaps(a, from, to, cal).forEach(g => tratti.push({ g, a, p: P(a.project_id) }));
       });
       tratti.sort((x, y) => x.g.from.localeCompare(y.g.from)
         || (x.p?.code || '').localeCompare(y.p?.code || '')
@@ -533,7 +561,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
                                locale, t('morning'), t('afternoon')),
           p ? `${p.code} - ${p.name}` : '—',
           a.name,
-          String(g.present),
+          fmtDays(g.present, locale),
           String(g.required),
           fmtDays(g.days, locale),
           fmtDays(g.missing, locale),
@@ -566,7 +594,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
               p ? `${p.code} - ${p.name}` : '—',
               a.name,
               p?.country ? `${[countryFlag(p.country), p.country].filter(Boolean).join(' ')}` : '—',
-              fmtDays(daysInRange(a, from, to), locale),
+              fmtDays(lavorati(a), locale),
             ];
           }),
         });
@@ -583,11 +611,18 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
         // Giorni occupati contati una volta sola: due impegni nello stesso
         // giorno sono un conflitto, non due giorni di lavoro. Prima si
         // sommavano, e il carico superava quello mostrato dal Gantt.
-        const busy = occupiedDays(suoi, from, to);
-        // Le assenze riducono i giorni disponibili: senza, chi e' in ferie
-        // meta' mese risulterebbe scarico invece che assente.
-        const off = occupiedDays(absences.filter(x => x.technician_id === tech.id), from, to);
-        const avail = Math.max(0, periodDays - off);
+        const busy = occupiedDays(suoi, from, to, cal);
+        // Disponibili: i giorni lavorativi della nazione di base del tecnico
+        // nel periodo, meno le assenze che vi cadono. Senza togliere le
+        // assenze, chi e' in ferie meta' mese risulterebbe scarico invece che
+        // assente. Un sabato lavorato conta fra i giorni di lavoro ma non fra
+        // i disponibili: la saturazione puo' superare il 100%.
+        const lavorativi = cal.techAvailableUnits(tech.id, from, to);
+        const viaAssenze = new Set();
+        absences.filter(x => x.technician_id === tech.id)
+          .forEach(x => cal.absenceUnits(x).forEach(u => { if (lavorativi.has(u)) viaAssenze.add(u); }));
+        const off = countDays(viaAssenze, from, to);
+        const avail = Math.max(0, countDays(lavorativi, from, to) - off);
         const pct = avail ? Math.round((busy / avail) * 100) : 0;
         return {
           name: tech.name,
@@ -627,7 +662,9 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           t('abs_' + x.type),
           formatActivityPeriod(x, locale, t('morning'), t('afternoon')),
           x.note || '',
-          fmtDays(daysInRange(x, from, to), locale),
+          // Giorni lavorativi del tecnico coperti dall'assenza: una
+          // settimana di ferie vale cinque giorni, non sette
+          fmtDays(countDays(cal.absenceUnits(x), from, to), locale),
         ]);
       return {
         headers: [t('technician'), t('baseCountry'), t('type'), t('period'), t('note'), t('daysCol')],
@@ -651,15 +688,18 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           const perTech = new Map();
           let tDone = 0, tPlanned = 0;
 
-          // Ogni periodo di ogni tecnico conta per le sue date. Un'attivita'
-          // senza tecnici conta come una persona, sotto la voce "—".
+          // Ogni periodo di ogni tecnico conta i suoi giorni lavorati. Un'attivita'
+          // senza tecnici conta i tecnici richiesti (una persona se il campo e'
+          // vuoto), sotto la voce "—".
           acts.forEach(a => {
             const periodi = assignmentsOf(a);
             const voci = periodi.length
               ? periodi.map(v => [v.technician.name, v])
               : [['—', a]];
             voci.forEach(([n, x]) => {
-              const s = splitDays(x, from, to, todayStr);
+              const s = x.technician
+                ? splitDone(cal.viewUnits(x), from, to, todayStr)
+                : activityManDaysSplit(x, cal, from, to, todayStr);
               const e = perTech.get(n) || { done: 0, planned: 0 };
               e.done += s.done;
               e.planned += s.planned;
@@ -721,7 +761,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           `${p.code} - ${p.name}`,
           v.name,
           formatActivityPeriod(v, locale, t('morning'), t('afternoon')),
-          fmtDays(daysInRange(v, from, to), locale),
+          fmtDays(lavorati(v), locale),
         ]);
       });
       rows.sort((a, b) => a[0].localeCompare(b[0]));
@@ -741,17 +781,17 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
         const e = m.get(cc);
         e.projects.add(a.project_id);
         e.acts += 1;
-        // Giorni uomo: la parte di ogni periodo che cade nel report.
-        // Un'attivita' senza tecnici conta come una persona.
+        // Giorni uomo: i giorni lavorati di ogni periodo che cadono nel
+        // report. Un'attivita' senza tecnici conta i tecnici richiesti.
         const periodi = assignmentsOf(a);
         if (periodi.length) {
           periodi.forEach(v => {
-            const d = daysInRange(v, from, to);
+            const d = countDays(cal.viewUnits(v), from, to);
             e.days += d;
             if (d > 0) e.techs.add(v.technician.id);
           });
         } else {
-          e.days += daysInRange(a, from, to);
+          e.days += activityManDays(a, cal, from, to);
         }
       });
       const rows = [...m.entries()]
@@ -803,12 +843,16 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
 
     return { headers: [], rows: [] };
   }, [reportType, scoped, technicians, projects, projectsById, from, to, techFilter,
-      countryFilter, projectFilter, locale, t, periodDays, activities, absences, from, to, skillFilter, projects]);
+      countryFilter, projectFilter, locale, t, activities, absences, skillFilter, cal]);
 
   const currentLabel = t(REPORT_TYPES.find(r => r.id === reportType).labelKey);
+  const nazioneScelta = countryFilter ? ` — ${[countryFlag(countryFilter), countryFilter].filter(Boolean).join(' ')}` : '';
+  const interoProgetto = reportType === 'soldvsdone';
   const subtitle = reportType === 'today'
-    ? `${t('date')}: ${new Date(from).toLocaleDateString(locale)}${countryFilter ? ` — ${[countryFlag(countryFilter), countryFilter].filter(Boolean).join(' ')}` : ''}`
-    : `${t('period')}: ${periodLabel}${countryFilter ? ` — ${[countryFlag(countryFilter), countryFilter].filter(Boolean).join(' ')}` : ''}`;
+    ? `${t('date')}: ${new Date(from).toLocaleDateString(locale)}${nazioneScelta}`
+    : interoProgetto
+      ? `${t('soldWholeProject')} ${new Date().toLocaleDateString(locale)}${nazioneScelta}`
+      : `${t('period')}: ${periodLabel}${nazioneScelta}`;
 
   const handlePrint = () => {
     if (data.groups) printReport(currentLabel, subtitle, null, null, data.groups);
@@ -816,12 +860,12 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
   };
 
   const handleCSV = () => {
-    const stamp = `${from}_${to}`;
+    const stamp = interoProgetto ? toInputDate(new Date()) : `${from}_${to}`;
     if (data.groups) downloadCSV(`${reportType}_${stamp}.csv`, data.flatHeaders, data.flatRows);
     else downloadCSV(`${reportType}_${stamp}.csv`, data.headers, data.rows);
   };
 
-  const isEmpty = periodoRovesciato || (data.todayGroups ? data.todayGroups.length === 0
+  const isEmpty = (periodoRovesciato && !interoProgetto) || (data.todayGroups ? data.todayGroups.length === 0
     : data.groups ? data.groups.length === 0 : data.rows.length === 0);
 
   const presets = useMemo(() => [
@@ -919,7 +963,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
           Nascosti nel report "Oggi", che guarda una data singola: li' un
           pulsante "Anno" porterebbe a osservare il primo gennaio. */}
       <div style={{
-        display: reportType === 'today' ? 'none' : 'flex',
+        display: reportType === 'today' || interoProgetto ? 'none' : 'flex',
         gap: 6, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center',
       }}>
         <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('quickPeriod')}:</span>
@@ -990,6 +1034,11 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
               {t('today')}
             </button>
           </>
+        ) : interoProgetto ? (
+          // Il venduto e' dell'intero progetto: le date non servirebbero
+          <span style={{ fontSize: 13, color: 'var(--muted)' }}>
+            {t('soldWholeProject')} {new Date().toLocaleDateString(locale)}
+          </span>
         ) : (
           <>
             <label style={{ fontSize: 13, color: 'var(--muted)' }}>{t('from')}</label>
@@ -1053,7 +1102,7 @@ function Reports({ projects, activities, technicians, absences = [], t, locale, 
       </div>
 
       {/* Anteprima */}
-      {periodoRovesciato ? (
+      {periodoRovesciato && !interoProgetto ? (
         <div style={{ padding: '2rem', textAlign: 'center', color: '#ef4444', fontSize: 14 }}>
           ⚠ {t('invertedPeriod')}
         </div>

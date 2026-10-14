@@ -10,11 +10,11 @@ e nazioni diverse e sapere chi è dove conta più di ogni altra cosa.
 
 ## Cosa fa
 
-- **Gantt** per progetto o per tecnico, vista settimana o mese
+- **Gantt** per progetto o per tecnico, vista settimana o mese, con le barre piene solo nei giorni lavorati
 - **Mezze giornate**: un'attività può occupare solo le mattine o solo i pomeriggi
-- **Giorni lavorativi**: indicando una durata, la fine salta riposi e festivi
+- **Giorni lavorati**: riposi e festivi della nazione non si contano; ogni attività può avere la sua settimana lavorativa (per esempio dal lunedì al sabato) e un sabato lavorato si segna a parte
 - **Festivi per nazione**, calcolati per 31 paesi o inseriti a mano
-- **Conflitti** rilevati da soli: doppie assegnazioni e lavoro durante le assenze
+- **Conflitti** rilevati da soli sui giorni lavorati; le assenze tolgono i loro giorni e la copertura mostra chi manca
 - **Assegnazioni a periodi**: un tecnico può lavorare solo su alcuni giorni di un'attività, anche in più periodi, impostati con una griglia delle presenze
 - **Tecnici richiesti** per attività, con il fabbisogno dei giorni ancora scoperti
 - **Giorni uomo venduti** per progetto o per fase, confrontati con quelli svolti
@@ -378,11 +378,11 @@ locations and countries and knowing who is where matters more than anything.
 
 ## What it does
 
-- **Gantt** by project or by technician, week or month view
+- **Gantt** by project or by technician, week or month view, with bars filled only on worked days
 - **Half days**: an activity can take mornings only or afternoons only
-- **Working days**: enter a duration and the end date skips rest days and holidays
+- **Worked days**: the country's rest days and holidays do not count; each activity can have its own working week (for example Monday to Saturday) and a worked Saturday is marked separately
 - **Holidays per country**, computed for 31 countries or entered manually
-- **Conflicts** detected automatically: double bookings and work during absences
+- **Conflicts** detected automatically on worked days; absences remove their days and the coverage shows who is missing
 - **Assignments by period**: a technician can work on just some days of an activity, even in several periods, set on a presence grid
 - **Required technicians** per activity, with the staffing gaps still to fill
 - **Sold man-days** per project or per phase, compared with those done

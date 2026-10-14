@@ -454,6 +454,18 @@ const initDB = async () => {
         CHECK (required_technicians IS NULL OR required_technicians > 0);
     `);
 
+    // Giorni di lavoro dell'attivita' (dalla 1.2.0).
+    // work_days: i giorni della settimana in cui si lavora, 0 = domenica come
+    //   in JavaScript e come i riposi per nazione. Vuoto = quelli della
+    //   nazione del progetto, cioe' il comportamento predefinito: un
+    //   magazzino aperto anche il sabato lo imposta una volta sola.
+    // work_holidays: si lavora anche nei festivi della nazione.
+    // Nessun dato esistente cambia: vuoto e falso sono i valori di sempre.
+    await pool.query(`
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS work_days SMALLINT[];
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS work_holidays BOOLEAN NOT NULL DEFAULT false;
+    `);
+
     // users.technician_id era stato creato con il comportamento predefinito
     // (NO ACTION): ogni tecnico creato dall'interfaccia ha un account collegato,
     // quindi nessun tecnico si poteva eliminare e il ripristino di un backup
@@ -673,6 +685,24 @@ const leggiRichiesti = (v) => {
     return { error: 'Il numero di tecnici richiesti deve essere un intero positivo' };
   }
   return { value: n };
+};
+
+// Giorni di lavoro dell'attivita': un elenco di giorni della settimana
+// (0 = domenica ... 6 = sabato), come array o come testo "1,2,3".
+// Vuoto significa "quelli della nazione del progetto".
+const leggiSettimana = (v) => {
+  if (v === null || v === undefined || v === '') return { value: null };
+  const elenco = Array.isArray(v) ? v : String(v).split(',');
+  if (!elenco.length) return { value: null };
+  const giorni = [];
+  for (const x of elenco) {
+    const n = Number(String(x).trim());
+    if (!Number.isInteger(n) || n < 0 || n > 6) {
+      return { error: 'I giorni di lavoro devono essere numeri da 0 (domenica) a 6 (sabato)' };
+    }
+    if (!giorni.includes(n)) giorni.push(n);
+  }
+  return { value: giorni.length ? giorni.sort((a, b) => a - b) : null };
 };
 
 // Assegnazioni dal corpo della richiesta, validate e normalizzate.
@@ -1046,6 +1076,10 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
   const richiesti = leggiRichiesti(req.body.required_technicians);
   if (richiesti.error) return res.status(400).json({ message: richiesti.error });
 
+  const settimana = leggiSettimana(req.body.work_days);
+  if (settimana.error) return res.status(400).json({ message: settimana.error });
+  const festiviLavorati = req.body.work_holidays === true || req.body.work_holidays === 'true';
+
   const assegnazioni = leggiAssegnazioni(req.body, actStart, actEnd, []);
   if (assegnazioni.error) return res.status(400).json({ message: assegnazioni.error });
 
@@ -1061,9 +1095,10 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
     // Crea l'attività
     const result = await client.query(
       `INSERT INTO activities (name, project_id, start_date, end_date, progress, start_half, end_half,
-                               day_part, sold_days, required_technicians)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-      [name, project_id, actStart, actEnd, progress || 0, sHalf, eHalf, dp, venditaAttivita, richiesti.value]
+                               day_part, sold_days, required_technicians, work_days, work_holidays)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::smallint[], $12) RETURNING *`,
+      [name, project_id, actStart, actEnd, progress || 0, sHalf, eHalf, dp, venditaAttivita, richiesti.value,
+       settimana.value, festiviLavorati]
     );
     
     const activity = result.rows[0];
@@ -1079,6 +1114,8 @@ app.post('/api/activities', authenticateToken, authorize(['admin', 'editor']), a
         periods: assegnazioni.value.length,
         partial: assegnazioni.value.filter(x => x.start_date || x.end_date).length,
         required: richiesti.value,
+        work_days: settimana.value,
+        work_holidays: festiviLavorati,
       },
     });
     res.status(201).json(activity);
@@ -1115,6 +1152,10 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
   const richiesti = leggiRichiesti(req.body.required_technicians);
   if (richiesti.error) return res.status(400).json({ message: richiesti.error });
 
+  const settimana = leggiSettimana(req.body.work_days);
+  if (settimana.error) return res.status(400).json({ message: settimana.error });
+  const festiviLavorati = req.body.work_holidays === true || req.body.work_holidays === 'true';
+
   // Serve il permesso sia sul progetto attuale sia su quello di destinazione
   const prevCC = await countryOfActivity(id);
   const newCC = await countryOfProject(project_id);
@@ -1128,6 +1169,9 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
   // Il campo dei tecnici richiesti e' nuovo: un client che non lo invia
   // non deve cancellare il valore salvato da chi lo conosce.
   const mandaRichiesti = Object.prototype.hasOwnProperty.call(req.body, 'required_technicians');
+  // Lo stesso per i giorni di lavoro, arrivati con la 1.2.0
+  const mandaSettimana = Object.prototype.hasOwnProperty.call(req.body, 'work_days');
+  const mandaFestivi = Object.prototype.hasOwnProperty.call(req.body, 'work_holidays');
 
   const client = await pool.connect();
   try {
@@ -1151,10 +1195,12 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
     const result = await client.query(
       `UPDATE activities SET name = $1, project_id = $2, start_date = $3, end_date = $4, progress = $5,
               start_half = $6, end_half = $7, day_part = $8, sold_days = $9,
-              required_technicians = CASE WHEN $11::boolean THEN $10::integer ELSE required_technicians END
-       WHERE id = $12 RETURNING *`,
+              required_technicians = CASE WHEN $11::boolean THEN $10::integer ELSE required_technicians END,
+              work_days = CASE WHEN $13::boolean THEN $12::smallint[] ELSE work_days END,
+              work_holidays = CASE WHEN $15::boolean THEN $14::boolean ELSE work_holidays END
+       WHERE id = $16 RETURNING *`,
       [name, project_id, actStart, actEnd, progress, sHalf, eHalf, dp, venditaAttivita,
-       richiesti.value, mandaRichiesti, id]
+       richiesti.value, mandaRichiesti, settimana.value, mandaSettimana, festiviLavorati, mandaFestivi, id]
     );
     if (!result.rows.length) {
       await client.query('ROLLBACK');
@@ -1176,6 +1222,8 @@ app.put('/api/activities/:id', authenticateToken, authorize(['admin', 'editor'])
         periods: assegnazioni.value.length,
         partial: assegnazioni.value.filter(x => x.start_date || x.end_date).length,
         required: upd.required_technicians,
+        work_days: upd.work_days,
+        work_holidays: upd.work_holidays,
       },
     });
     res.json(upd);
@@ -2189,6 +2237,82 @@ const authenticateDevice = async (req, res, next) => {
 };
 
 // Agenda personale: solo lettura, solo le proprie attivita'
+// ---------------------------------------------------------------------------
+// Giorni lavorati (dalla 1.2.0), con le stesse regole di
+// frontend/src/planning.js. Servono all'app dei tecnici, che non conosce
+// festivi e riposi: il server le manda, per ogni periodo, l'elenco dei giorni
+// in cui si lavora davvero.
+//   1. i giorni di riposo dell'attivita' non si lavorano: quelli fuori dalla
+//      sua settimana lavorativa (di norma il fine settimana della nazione del
+//      progetto) e i festivi della nazione, salvo work_holidays;
+//   2. un periodo fatto solo di giorni di riposo si lavora tutto (un sabato
+//      lavorato si salva cosi').
+// Le date sono stringhe AAAA-MM-GG e si calcolano in UTC: nessun fuso orario
+// puo' spostarle di un giorno.
+// ---------------------------------------------------------------------------
+const giornoSuccessivo = (g) => {
+  const d = new Date(g + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+};
+
+const settimanaDiLavoro = (w) => {
+  let x = w;
+  if (typeof x === 'string') x = x.replace(/[{}\s]/g, '').split(',').filter(Boolean);
+  if (!Array.isArray(x)) return null;
+  const giorni = [...new Set(x.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6))];
+  return giorni.length ? giorni : null;
+};
+
+// Festivi per nazione e riposi per nazione, letti una volta per richiesta
+const caricaCalendario = async (nazioni) => {
+  const elenco = [...new Set(nazioni.filter(Boolean).map(c => String(c).trim().toUpperCase()))];
+  const festivi = new Map();
+  if (elenco.length) {
+    const r = await pool.query(
+      `SELECT TRIM(country) AS country, to_char(date, 'YYYY-MM-DD') AS giorno
+       FROM holidays WHERE TRIM(country) = ANY($1)`, [elenco]);
+    r.rows.forEach(h => {
+      if (!festivi.has(h.country)) festivi.set(h.country, new Set());
+      festivi.get(h.country).add(h.giorno);
+    });
+  }
+  const riposi = {};
+  (await pool.query('SELECT TRIM(country) AS country, days FROM country_weekend')).rows
+    .forEach(x => { riposi[x.country] = (x.days || []).map(Number); });
+  return { festivi, riposi };
+};
+
+const giorniLavoratiDi = (inizio, fine, att, calendario) => {
+  const nazione = att.country ? String(att.country).trim().toUpperCase() : null;
+  const settimana = settimanaDiLavoro(att.work_days);
+  const riposiNazione = (nazione && calendario.riposi[nazione]) || [0, 6];
+  const festivi = (nazione && calendario.festivi.get(nazione)) || new Set();
+  const riposo = (g) => {
+    const dow = new Date(g + 'T00:00:00Z').getUTCDay();
+    if (settimana ? !settimana.includes(dow) : riposiNazione.includes(dow)) return true;
+    return !att.work_holidays && festivi.has(g);
+  };
+  const tutti = [];
+  for (let g = inizio; g && g <= fine && tutti.length < 4000; g = giornoSuccessivo(g)) tutti.push(g);
+  const utili = tutti.filter(g => !riposo(g));
+  return utili.length ? utili : tutti;
+};
+
+// Giorni interamente coperti da un'assenza (le mezze giornate non tolgono
+// il giorno: la mattina o il pomeriggio si lavora)
+const giorniInteriDiAssenza = (assenze) => {
+  const via = new Set();
+  assenze.forEach(x => {
+    for (let g = x.inizio; g && g <= x.fine; g = giornoSuccessivo(g)) {
+      const daMattina = g > x.inizio || x.start_half !== 'PM';
+      const finoASera = g < x.fine || x.end_half !== 'AM';
+      if (daMattina && finoASera) via.add(g);
+    }
+  });
+  return via;
+};
+
 app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
   const { from, to } = req.query;
   const params = [req.device.technician_id];
@@ -2211,7 +2335,10 @@ app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
               COALESCE(at.end_date, a.end_date) AS end_date,
               a.start_date AS activity_start_date, a.end_date AS activity_end_date,
               a.start_half, a.end_half, a.day_part, a.progress,
-              p.code AS project_code, p.name AS project_name, p.color AS project_color, p.country
+              p.code AS project_code, p.name AS project_name, p.color AS project_color, p.country,
+              a.work_days, a.work_holidays,
+              to_char(COALESCE(at.start_date, a.start_date), 'YYYY-MM-DD') AS g_inizio,
+              to_char(COALESCE(at.end_date, a.end_date), 'YYYY-MM-DD') AS g_fine
        FROM activities a
        JOIN activity_technicians at ON at.activity_id = a.id
        LEFT JOIN projects p ON p.id = a.project_id
@@ -2233,11 +2360,16 @@ app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
     // mostrare giorno per giorno chi c'e': chi lavora tutta la durata ha
     // colleghi diversi nelle diverse settimane.
     const mates = await pool.query(
-      `SELECT DISTINCT at1.id AS assignment_id, t.name, t.color,
+      `SELECT DISTINCT at1.id AS assignment_id, at2.id AS mate_assignment_id, at2.technician_id,
+              t.name, t.color,
               COALESCE(at2.start_date, a.start_date) AS start_date,
-              COALESCE(at2.end_date, a.end_date) AS end_date
+              COALESCE(at2.end_date, a.end_date) AS end_date,
+              to_char(COALESCE(at2.start_date, a.start_date), 'YYYY-MM-DD') AS g_inizio,
+              to_char(COALESCE(at2.end_date, a.end_date), 'YYYY-MM-DD') AS g_fine,
+              a.work_days, a.work_holidays, p.country
        FROM activity_technicians at1
        JOIN activities a ON a.id = at1.activity_id
+       LEFT JOIN projects p ON p.id = a.project_id
        JOIN activity_technicians at2 ON at2.activity_id = at1.activity_id
        JOIN technicians t ON t.id = at2.technician_id
        WHERE at1.technician_id = $1 AND at2.technician_id <> $1
@@ -2245,16 +2377,46 @@ app.get('/api/tech/agenda', authenticateDevice, async (req, res) => {
          AND COALESCE(at2.end_date, a.end_date) >= COALESCE(at1.start_date, a.start_date)`,
       [req.device.technician_id]);
 
+    // Giorni lavorati: per i periodi del tecnico e per quelli dei colleghi.
+    // Ai colleghi si tolgono anche i giorni interi di assenza: la PWA non
+    // conosce le loro assenze, e non deve mostrare "con Marco" mentre Marco
+    // e' in ferie. Le assenze del tecnico stesso le mostra la PWA.
+    const calendario = await caricaCalendario([
+      ...acts.rows.map(a => a.country), ...mates.rows.map(m => m.country)]);
+    const idColleghi = [...new Set(mates.rows.map(m => m.technician_id))];
+    const assenzeColleghi = new Map();
+    if (idColleghi.length) {
+      (await pool.query(
+        `SELECT technician_id, start_half, end_half,
+                to_char(start_date, 'YYYY-MM-DD') AS inizio, to_char(end_date, 'YYYY-MM-DD') AS fine
+         FROM technician_absences WHERE technician_id = ANY($1)`, [idColleghi])).rows
+        .forEach(x => {
+          if (!assenzeColleghi.has(x.technician_id)) assenzeColleghi.set(x.technician_id, []);
+          assenzeColleghi.get(x.technician_id).push(x);
+        });
+    }
+    const viaColleghi = new Map([...assenzeColleghi.entries()]
+      .map(([id, l]) => [id, giorniInteriDiAssenza(l)]));
+
     const perPeriodo = {};
     mates.rows.forEach(m => {
-      (perPeriodo[m.assignment_id] = perPeriodo[m.assignment_id] || [])
-        .push({ name: m.name, color: m.color, start_date: m.start_date, end_date: m.end_date });
+      const via = viaColleghi.get(m.technician_id) || new Set();
+      (perPeriodo[m.assignment_id] = perPeriodo[m.assignment_id] || []).push({
+        name: m.name, color: m.color, start_date: m.start_date, end_date: m.end_date,
+        days: giorniLavoratiDi(m.g_inizio, m.g_fine, m, calendario).filter(g => !via.has(g)),
+      });
     });
 
     res.json({
       technician: { id: req.device.technician_id, name: req.device.name,
                     home_country: req.device.home_country, color: req.device.color },
-      activities: acts.rows.map(a => ({ ...a, mates: perPeriodo[a.assignment_id] || [] })),
+      activities: acts.rows.map(({ g_inizio, g_fine, ...a }) => ({
+        ...a,
+        // Giorni in cui il tecnico lavora su questo periodo (senza togliere
+        // le sue assenze, che la PWA mostra a parte)
+        days: giorniLavoratiDi(g_inizio, g_fine, a, calendario),
+        mates: perPeriodo[a.assignment_id] || [],
+      })),
       absences: abs.rows,
     });
   } catch (error) {
@@ -2409,9 +2571,11 @@ app.post('/api/projects/:id/duplicate', authenticateToken, authorize(['admin', '
     for (const a of acts) {
       const na = (await client.query(
         `INSERT INTO activities (name, project_id, start_date, end_date, progress,
-                                 start_half, end_half, day_part, sold_days, required_technicians)
+                                 start_half, end_half, day_part, sold_days, required_technicians,
+                                 work_days, work_holidays)
          SELECT name, $1, start_date + $2::int, end_date + $2::int, 0,
-                start_half, end_half, day_part, sold_days, required_technicians
+                start_half, end_half, day_part, sold_days, required_technicians,
+                work_days, work_holidays
          FROM activities WHERE id = $3
          RETURNING id`,
         [np.id, shift, a.id]

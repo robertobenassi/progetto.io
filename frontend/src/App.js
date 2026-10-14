@@ -5,14 +5,15 @@ import { REGIONS, countryName } from './countries';
 import { computeHolidays, SUPPORTED as HOLIDAY_COUNTRIES } from './holidays';
 import {
   actStartUnit, actDurationDays, dayPartOf,
-  addWorkingDays, countWorkingDays, calendarDays, toInputDate, weekendDays,
-  isoDay, formatActivityPeriod, fmtDays, isNonWorking,
+  calendarDays, toInputDate, weekendDays,
+  isoDay, formatActivityPeriod, fmtDays,
 } from './dateUtils';
 // Calcoli per periodo di assegnazione: un tecnico puo' lavorare solo su una
 // parte di un'attivita', anche in piu' periodi separati
 import {
-  assignmentKey, assignmentsByTech, findConflicts, conflictMarks,
+  assignmentKey, assignmentsByTech, assignmentsOf, findConflicts, conflictMarks,
   findAbsenceConflicts, occupiedDays, shiftPeriods, toAssignments,
+  makeCalendar, workWeekOf, addWorkedDays, dayList, countDays, morningUnit, activityManDays,
 } from './planning.js';
 import AssignmentGrid from './AssignmentGrid.js';
 import { Calendar, Users, Briefcase, Activity, LogOut, ChevronDown, ChevronRight, Edit2, Trash2, Plus, Save, Clock, User, Phone, Mail, Award } from 'lucide-react';
@@ -252,6 +253,12 @@ const App = () => {
   // Un tecnico senza voce lavora per tutta la durata.
   const [formPeriods, setFormPeriods] = useState({});
   const [formRequired, setFormRequired] = useState('');
+  // Progetto scelto nella finestra: decide nazione, festivi e riposi
+  const [formProjectId, setFormProjectId] = useState('');
+  // Giorni della settimana in cui si lavora (0 = domenica); null vuol dire
+  // "quelli della nazione del progetto"
+  const [formWorkWeek, setFormWorkWeek] = useState(null);
+  const [formWorkHolidays, setFormWorkHolidays] = useState(false);
   const [techSearch, setTechSearch] = useState('');
   const [techListSearch, setTechListSearch] = useState('');
   const [userSearch, setUserSearch] = useState('');
@@ -919,7 +926,15 @@ const handleSaveActivity = async (activityData) => {
   // conflitto con un impegno della seconda. Il calcolo sta in planning.js.
   // Gli elementi di activities sono viste di assegnazione: per aprire
   // l'attivita' si usa .activity, mai la vista.
-  const detectedConflicts = useMemo(() => findConflicts(activities), [activities]);
+  // Calendario di lavoro: festivi e riposi per nazione, nazioni dei progetti
+  // e dei tecnici, assenze. Decide quali giorni di un periodo si lavorano.
+  const calendario = useMemo(
+    () => makeCalendar({ holidays, weekendMap, projects, technicians, absences }),
+    [holidays, weekendMap, projects, technicians, absences]);
+
+  // Dalla 1.2.0 si confrontano solo i giorni lavorati: un fine settimana di
+  // riposo o un giorno di ferie non sono un conflitto.
+  const detectedConflicts = useMemo(() => findConflicts(activities, calendario), [activities, calendario]);
 
 
   // Numero con il sostantivo al singolare o al plurale: "1 periodo", "2 periodi"
@@ -960,11 +975,49 @@ const handleSaveActivity = async (activityData) => {
     return m;
   }, [projects]);
 
-  // Nazione del progetto selezionato: decide festivi e giorni di riposo
+  // Nazione del progetto selezionato: decide festivi e giorni di riposo.
+  // Segue la scelta nella finestra, non solo il progetto di partenza.
   const formCountry = useMemo(() => {
-    const pid = editingActivity?.project_id;
-    return projectsById.get(pid)?.country || 'IT';
-  }, [editingActivity, projectsById]);
+    const pid = Number(formProjectId) || editingActivity?.project_id;
+    return (projectsById.get(pid)?.country || 'IT').trim();
+  }, [formProjectId, editingActivity, projectsById]);
+
+  // L'attivita' come appare nella finestra, prima di salvarla: serve al
+  // calendario per sapere i riposi (nazione, settimana, festivi lavorati)
+  const formAttivita = useMemo(() => ({
+    id: editingActivity?.id ?? 'nuova',
+    project_id: Number(formProjectId) || editingActivity?.project_id || null,
+    country: formCountry,
+    work_days: formWorkWeek,
+    work_holidays: formWorkHolidays,
+    day_part: formDayPart,
+    start_date: formStart,
+    end_date: formEnd,
+    required_technicians: formRequired,
+  }), [editingActivity, formProjectId, formCountry, formWorkWeek, formWorkHolidays,
+       formDayPart, formStart, formEnd, formRequired]);
+
+  // Giorno di riposo per l'attivita' nella finestra
+  const formIsRest = useCallback((g) => calendario.restDay(formAttivita, g), [calendario, formAttivita]);
+
+  // Settimana lavorativa della nazione, per i pulsanti dei giorni
+  const settimanaNazione = useMemo(() => {
+    const riposi = weekendDays(formCountry, weekendMap).map(Number);
+    return [0, 1, 2, 3, 4, 5, 6].filter(d => !riposi.includes(d));
+  }, [formCountry, weekendMap]);
+  const settimanaEffettiva = formWorkWeek || settimanaNazione;
+
+  // Accende o spegne un giorno della settimana. Se il risultato coincide con
+  // la settimana della nazione si torna al valore predefinito (vuoto), cosi'
+  // l'attivita' segue eventuali cambi dei riposi della nazione.
+  const cambiaGiornoSettimana = (d) => {
+    const nuova = settimanaEffettiva.includes(d)
+      ? settimanaEffettiva.filter(x => x !== d)
+      : [...settimanaEffettiva, d].sort((a, b) => a - b);
+    if (!nuova.length) return;
+    const uguale = nuova.length === settimanaNazione.length && nuova.every(x => settimanaNazione.includes(x));
+    setFormWorkWeek(uguale ? null : nuova);
+  };
 
   const handleStartChange = (value) => {
     if (!value) { setFormStart(value); return; }
@@ -980,9 +1033,9 @@ const handleSaveActivity = async (activityData) => {
         Object.entries(prev).map(([id, periodi]) => [id, shiftPeriods(periodi, delta)])));
     };
     // Se e' stata indicata una durata, la fine si ricalcola sui giorni
-    // lavorativi della nazione del progetto.
+    // lavorati dell'attivita' (settimana, festivi, nazione del progetto).
     if (formWorkDays) {
-      setFormEnd(addWorkingDays(value, formWorkDays, formCountry, holidays, weekendMap));
+      setFormEnd(addWorkedDays(value, formWorkDays, formIsRest));
       sposta();
     } else if (formStart && formEnd) {
       const dur = daysBetween(formStart, formEnd);
@@ -995,7 +1048,7 @@ const handleSaveActivity = async (activityData) => {
   const handleWorkDaysChange = (value) => {
     setFormWorkDays(value);
     if (value && formStart) {
-      setFormEnd(addWorkingDays(formStart, value, formCountry, holidays, weekendMap));
+      setFormEnd(addWorkedDays(formStart, value, formIsRest));
     }
   };
 
@@ -1007,32 +1060,45 @@ const handleSaveActivity = async (activityData) => {
   };
 
   const dateError = Boolean(formStart && formEnd && new Date(formEnd) < new Date(formStart));
-  const giorniCalendario = (formStart && formEnd && !dateError)
+  const dateValide = Boolean(formStart && formEnd && !dateError);
+  const giorniCalendario = dateValide
     ? calendarDays({ start_date: formStart, end_date: formEnd }) : null;
-  const durationDays = giorniCalendario
-    ? giorniCalendario * (formDayPart === 'FULL' ? 1 : 0.5) : null;
-  const giorniLavorativi = (formStart && formEnd && !dateError)
-    ? countWorkingDays(formStart, formEnd, formCountry, holidays, weekendMap) : null;
-  // Segnalazione, non blocco: negli impianti si interviene proprio nei fermi
-  const includeNonLavorativi = Boolean(giorniCalendario && giorniLavorativi !== null
-    && giorniLavorativi < giorniCalendario);
+  // Giorni lavorativi dell'attivita': senza riposi, festivi (se non si
+  // lavorano) e giorni fuori dalla sua settimana
+  const giorniLavorativi = dateValide
+    ? dayList(formStart, formEnd).filter(g => !formIsRest(g)).length : null;
+  // Un'attivita' fatta solo di giorni di riposo si lavora tutta: e' un
+  // intervento voluto in un fermo, e lo si dice
+  const soloRiposo = dateValide && giorniLavorativi === 0;
+  const giorniLavorati = soloRiposo ? giorniCalendario : giorniLavorativi;
+  const durationDays = dateValide
+    ? giorniLavorati * (formDayPart === 'FULL' ? 1 : 0.5) : null;
 
   // Giorni uomo pianificati nella finestra, tecnico per tecnico, dai giorni
-  // accesi nella griglia: ogni giorno vale 1, o 0,5 per le attivita' di sole
-  // mattine o soli pomeriggi. Si contano i giorni di calendario, come nel
-  // report Giorni uomo, cosi' i due numeri coincidono.
+  // accesi nella griglia: ogni giorno lavorato vale 1, o 0,5 per le attivita'
+  // di sole mattine o soli pomeriggi; le assenze tolgono i loro giorni. E'
+  // lo stesso calcolo dei report, cosi' i numeri coincidono.
+  // Senza tecnici, se ne sono richiesti, si stimano i giorni uomo come
+  // tecnici richiesti per giorni lavorati.
   const giorniUomoForm = useMemo(() => {
-    if (!formStart || !formEnd || dateError) return [];
-    const peso = formDayPart === 'FULL' ? 1 : 0.5;
+    if (!dateValide) return { tecnici: [], stima: null };
+    const bozza = {
+      ...formAttivita,
+      technicians: selectedTechnicians.map(id => ({ id, name: '' })),
+      assignments: toAssignments(selectedTechnicians, formPeriods, formStart, formEnd, formIsRest)
+        .map((p, i) => ({ id: `f${i}`, ...p })),
+    };
     const perTecnico = new Map();
-    toAssignments(selectedTechnicians, formPeriods, formStart, formEnd).forEach(p => {
-      const da = p.start_date || formStart;
-      const a = p.end_date || formEnd;
-      const giorni = daysBetween(da, a) + 1;
-      perTecnico.set(p.technician_id, (perTecnico.get(p.technician_id) || 0) + giorni * peso);
+    assignmentsOf(bozza).forEach(v => {
+      const n = countDays(calendario.viewUnits(v));
+      perTecnico.set(v.technician.id, (perTecnico.get(v.technician.id) || 0) + n);
     });
-    return [...perTecnico.entries()];
-  }, [formStart, formEnd, dateError, formDayPart, selectedTechnicians, formPeriods]);
+    const richiesti = Number(formRequired) || 0;
+    const stima = !selectedTechnicians.length && richiesti
+      ? { richiesti, giorni: countDays(calendario.activityUnits(bozza)) } : null;
+    return { tecnici: [...perTecnico.entries()], stima };
+  }, [dateValide, formAttivita, selectedTechnicians, formPeriods, formStart, formEnd, formIsRest,
+      formRequired, calendario]);
 
   useEffect(() => {
     if (showActivityModal || showEditModal) {
@@ -1040,6 +1106,9 @@ const handleSaveActivity = async (activityData) => {
       setFormEnd(editingActivity?.end_date ? formatDateForInput(editingActivity.end_date) : '');
       setFormDayPart(editingActivity ? dayPartOf(editingActivity) : 'FULL');
       setFormWorkDays('');
+      setFormProjectId(editingActivity?.project_id ? String(editingActivity.project_id) : '');
+      setFormWorkWeek(workWeekOf(editingActivity));
+      setFormWorkHolidays(Boolean(editingActivity?.work_holidays));
       setTechSearch('');
       // Periodi salvati, raggruppati per tecnico. Senza l'elenco dei periodi
       // (server precedente o attivita' nuova) ognuno vale per tutta la durata.
@@ -1101,16 +1170,17 @@ const handleSaveActivity = async (activityData) => {
   //   per la vista per progetto, dove ogni attivita' ha una barra sola.
   // conflictingAssignmentKeys: i singoli periodi in conflitto, per la vista
   //   per tecnico: la barra di Luca non si colora per un conflitto di Marco.
-  const conflictSets = useMemo(() => conflictMarks(activities), [activities]);
+  const conflictSets = useMemo(() => conflictMarks(activities, calendario), [activities, calendario]);
   const conflictingActivityIds = conflictSets.activityIds;
   const conflictingAssignmentKeys = conflictSets.assignmentKeys;
+  const conflictUnitsByKey = conflictSets.unitsByKey;
 
-  // Un'attivita' assegnata a un tecnico durante una sua assenza e' un conflitto,
-  // ma di natura diversa dalla doppia assegnazione: va segnalato, mai impedito.
-  // Capita di richiamare qualcuno dalle ferie. Conta solo il periodo del
-  // tecnico: un permesso nei giorni in cui lavora un altro non e' un conflitto.
+  // Assenze nei giorni in cui un tecnico era pianificato. Dalla 1.2.0 non
+  // sono conflitti: quei giorni non si contano come lavorati e la copertura
+  // mostra chi manca. Restano segnalate come informazione, perche' chi
+  // pianifica deve sapere che serve qualcun altro.
   const absenceConflicts = useMemo(
-    () => findAbsenceConflicts(activities, absences), [activities, absences]);
+    () => findAbsenceConflicts(activities, absences, calendario), [activities, absences, calendario]);
 
   // Le stesse segnalazioni indicizzate per periodo, per la vista per tecnico
   const absenceByAssignment = useMemo(() => {
@@ -1207,7 +1277,10 @@ const handleSaveActivity = async (activityData) => {
     // Con una sola nazione filtrata l'ombreggiatura e' univoca. Con piu'
     // nazioni i festivi non si evidenziano: un giorno rosso che vale solo
     // per un paese si legge come "qui non si lavora" e induce in errore.
-    const nazioneUnica = filterCountries.length === 1 ? filterCountries[0] : null;
+    // Se tutti i progetti sono della stessa nazione vale lo stesso, anche
+    // senza filtro.
+    const nazioneUnica = filterCountries.length === 1 ? filterCountries[0]
+      : availableCountries.length === 1 ? availableCountries[0] : null;
     const riposi = nazioneUnica ? weekendDays(nazioneUnica, weekendMap) : [0, 6];
 
     const festiviVisibili = nazioneUnica
@@ -1283,22 +1356,51 @@ const handleSaveActivity = async (activityData) => {
       return { left, width: right - left, clippedLeft: tagliatoASinistra };
     };
 
-    // Motivo a mezze celle per le attivita' di sola mattina o solo pomeriggio.
-    // Un unico elemento con un gradiente ripetuto: nessun costo aggiuntivo
-    // rispetto a una barra piena.
-    const halfDayPattern = (activity, colore) => {
-      const dp = dayPartOf(activity);
-      if (dp === 'FULL') return undefined;
-      return dp === 'AM'
-        ? `repeating-linear-gradient(to right, ${colore} 0 ${HALF}px, transparent ${HALF}px ${DAY_W}px)`
-        : `repeating-linear-gradient(to right, transparent 0 ${HALF}px, ${colore} ${HALF}px ${DAY_W}px)`;
-    };
-
     // Giorni occupati nel periodo visibile, contati una volta sola anche
     // quando due impegni si sovrappongono. Conta in mezze giornate: chi lavora
-    // solo le mattine occupa mezza unita' per ogni giorno.
-    const loadDays = (items) =>
-      occupiedDays(items, isoDay(dates[0]), isoDay(dates[dates.length - 1]));
+    // solo le mattine occupa mezza unita' per ogni giorno. Dalla 1.2.0 contano
+    // solo i giorni lavorati.
+    const primoVisibile = isoDay(dates[0]);
+    const ultimoVisibile = isoDay(dates[dates.length - 1]);
+    const loadDays = (items) => occupiedDays(items, primoVisibile, ultimoVisibile, calendario);
+
+    // Barre a giorni lavorati: la barra va dal primo all'ultimo giorno, ma e'
+    // piena solo nei giorni (o nelle mezze giornate) in cui si lavora. Nei
+    // riposi resta il contorno sottile, cosi' un sabato lavorato si vede
+    // a colpo d'occhio. I tratti sono in pixel, relativi alla barra.
+    const u0Visibile = morningUnit(primoVisibile);
+    const u1Visibile = morningUnit(ultimoVisibile) + 1;
+    const trattiPx = (units, pos) => {
+      const lista = [...units].filter(u => u >= u0Visibile && u <= u1Visibile).sort((a, b) => a - b);
+      const out = [];
+      lista.forEach(u => {
+        const x0 = (u - u0Visibile) * HALF - pos.left;
+        const ultimo = out[out.length - 1];
+        if (ultimo && ultimo.u === u - 1) { ultimo.x1 = x0 + HALF; ultimo.u = u; }
+        else out.push({ x0, x1: x0 + HALF, u });
+      });
+      return out;
+    };
+    // Mezze giornate lavorate e mezze giornate pianificate ma perse per
+    // un'assenza. Per un'attivita' intera: lavorate da almeno un tecnico;
+    // assenze dove era pianificato qualcuno ma non lavora nessuno.
+    const unitaBarra = (activity) => {
+      if (activity.activity) {
+        const lavoro = calendario.viewUnits(activity);
+        const assenza = new Set([...calendario.plannedUnits(activity)].filter(u => !lavoro.has(u)));
+        return { lavoro, assenza };
+      }
+      const viste = assignmentsOf(activity);
+      if (!viste.length) return { lavoro: calendario.activityUnits(activity), assenza: new Set() };
+      const lavoro = new Set();
+      const pianificate = new Set();
+      viste.forEach(v => {
+        calendario.viewUnits(v).forEach(u => lavoro.add(u));
+        calendario.plannedUnits(v).forEach(u => pianificate.add(u));
+      });
+      return { lavoro, assenza: new Set([...pianificate].filter(u => !lavoro.has(u))) };
+    };
+    const TRATTEGGIO_ASSENZA = 'repeating-linear-gradient(45deg, rgba(245,158,11,0.85) 0 3px, transparent 3px 7px)';
 
     const isToday = (d) => new Date().toDateString() === d.toDateString();
 
@@ -1340,8 +1442,21 @@ const handleSaveActivity = async (activityData) => {
         ? (absenceByAssignment.get(assignmentKey(activity)) || [])
         : (absenceConflicts.get(activity.id) || []);
       const onLeave = assenze.length > 0;
-      const conflict = overlap || onLeave;
+      // Solo la doppia assegnazione e' un conflitto; le assenze tolgono giorni
+      const conflict = overlap;
       const periodo = formatActivityPeriod(activity, locale, t('morning'), t('afternoon'));
+      const colore = color || '#555555';
+      const { lavoro, assenza } = pos ? unitaBarra(activity) : { lavoro: new Set(), assenza: new Set() };
+      // Mezze giornate in conflitto: quelle del periodo, oppure di tutti i
+      // periodi dell'attivita' nella vista per progetto
+      const inConflitto = new Set();
+      if (pos && overlap) {
+        (vista ? [activity] : assignmentsOf(activity)).forEach(v =>
+          (conflictUnitsByKey.get(assignmentKey(v)) || []).forEach(u => inConflitto.add(u)));
+      }
+      const giorniTesto = vista
+        ? `${fmtDays(countDays(lavoro), locale)} ${t('workedDaysWord')}`
+        : `${fmtDays(activityManDays(activity, calendario), locale)} ${t('manDays').toLowerCase()}`;
       return (
         <div style={{ display: 'flex', height: ROW_H, borderBottom: '1px solid var(--border)', backgroundColor: 'var(--rowAlt)' }}>
           <LeftCell bg="var(--rowAlt)" indent>
@@ -1356,32 +1471,46 @@ const handleSaveActivity = async (activityData) => {
                   setSelectedTechnicians(techs.map(t => t.id));
                   setShowEditModal(true);
                 }}
-                title={`${onLeave ? '⚠ ' + t('duringAbsence') + ': ' + assenze.map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${activity.name} — ${periodo} — ${actDurationDays(activity)} ${t('calendarDays')}`}
+                title={`${overlap ? '⚠ ' + t('doubleBooking') + '\n' : ''}${onLeave ? '🏖 ' + t('absence') + ': ' + assenze.map(x => `${x.tech} (${t('abs_' + x.type)})`).join(', ') + '\n' : ''}${activity.name} — ${periodo} — ${giorniTesto}`}
                 style={{
                   position: 'absolute', top: 8, height: ROW_H - 16,
                   left: pos.left, width: pos.width,
-                  // Il conflitto non usa piu' il rosso pieno: era indistinguibile
+                  // La barra e' piena solo nei giorni lavorati (tratti qui
+                  // sotto); il contorno sottile tiene insieme i riposi.
+                  // Il conflitto non usa il rosso pieno: era indistinguibile
                   // da un tecnico che ha scelto il rosso come proprio colore.
                   // Striature diagonali e bordo marcato funzionano con qualsiasi
                   // colore e restano leggibili anche a chi non distingue i rossi.
-                  // Fascia oraria come motivo a mezze celle; il conflitto come
-                  // striature diagonali sopra. I due livelli convivono.
-                  backgroundColor: dayPartOf(activity) === 'FULL' ? (color || '#555555') : 'transparent',
-                  backgroundImage: [
-                    conflict ? 'repeating-linear-gradient(45deg, rgba(0,0,0,0.55) 0 5px, rgba(255,255,255,0.30) 5px 10px)' : null,
-                    halfDayPattern(activity, color || '#555555'),
-                  ].filter(Boolean).join(', ') || undefined,
                   borderRadius: 4, cursor: 'pointer',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   fontSize: 12, color: 'white', fontWeight: 500,
-                  border: conflict ? '2px solid #ef4444'
-                        : (dayPartOf(activity) === 'FULL' ? '1px solid var(--border)' : 'none'),
+                  border: conflict ? '2px solid #ef4444' : `1px solid ${colore}`,
                   boxSizing: 'border-box',
                   overflow: 'hidden', whiteSpace: 'nowrap',
                 }}>
+                {trattiPx(lavoro, pos).map(x => (
+                  <span key={'l' + x.u} style={{
+                    position: 'absolute', top: 0, bottom: 0, left: x.x0, width: x.x1 - x.x0,
+                    backgroundColor: colore, pointerEvents: 'none',
+                  }} />
+                ))}
+                {trattiPx(assenza, pos).map(x => (
+                  <span key={'a' + x.u} style={{
+                    position: 'absolute', top: 0, bottom: 0, left: x.x0, width: x.x1 - x.x0,
+                    backgroundImage: TRATTEGGIO_ASSENZA, pointerEvents: 'none',
+                  }} />
+                ))}
+                {trattiPx(inConflitto, pos).map(x => (
+                  <span key={'c' + x.u} style={{
+                    position: 'absolute', top: 0, bottom: 0, left: x.x0, width: x.x1 - x.x0, pointerEvents: 'none',
+                    backgroundImage: 'repeating-linear-gradient(45deg, rgba(0,0,0,0.55) 0 5px, rgba(255,255,255,0.30) 5px 10px)',
+                  }} />
+                ))}
                 <span style={{
                   overflow: 'hidden', textOverflow: 'ellipsis', padding: '0 6px',
-                  textShadow: conflict ? '0 1px 3px rgba(0,0,0,0.9)' : undefined,
+                  // Il testo puo' cadere su un giorno di riposo vuoto: l'ombra
+                  // lo rende leggibile anche li'
+                  textShadow: '0 1px 3px rgba(0,0,0,0.9)',
                   position: 'relative',
                 }}>
                   {conflict ? '⚠ ' : ''}{barText || (activity.progress != null ? `${activity.progress}%` : '')}
@@ -1659,7 +1788,10 @@ const handleSaveActivity = async (activityData) => {
               );
               const expanded = expandedTechs.includes(tech.id);
               const busy = loadDays(acts);
-              const pct  = Math.round((busy / dates.length) * 100);
+              // Disponibili: i giorni lavorativi della nazione di base del
+              // tecnico nel periodo visibile
+              const disponibili = countDays(calendario.techAvailableUnits(tech.id, primoVisibile, ultimoVisibile));
+              const pct  = disponibili ? Math.round((busy / disponibili) * 100) : 0;
 
               return (
                 <div key={tech.id} style={{
@@ -1679,7 +1811,7 @@ const handleSaveActivity = async (activityData) => {
                         </span>
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 24 }}>
-                        {t('workload')}: {fmtDays(busy, locale)}/{dates.length} {t('days')} ({pct}%)
+                        {t('workload')}: {fmtDays(busy, locale)}/{fmtDays(disponibili, locale)} {t('days')} ({pct}%)
                       </div>
                     </LeftCell>
 
@@ -1715,6 +1847,7 @@ const handleSaveActivity = async (activityData) => {
                         const p = barPos(a);
                         if (!p) return null;
                         const prj = projects.find(pr => pr.id === a.project_id);
+                        const coloreBarra = prj?.color || '#555555';
                         // Cliccabili come le barre estese: aprono l'attivita'
                         // originale, non la vista con le date del tecnico
                         return (
@@ -1729,14 +1862,19 @@ const handleSaveActivity = async (activityData) => {
                               cursor: 'pointer', zIndex: 2,
                               position: 'absolute', top: 14, height: 20,
                               left: p.left, width: p.width,
-                              backgroundColor: dayPartOf(a) === 'FULL' ? (prj?.color || '#555555') : 'transparent',
-                              backgroundImage: halfDayPattern(a, prj?.color || '#555555'),
+                              border: `1px solid ${coloreBarra}`, boxSizing: 'border-box',
                               borderRadius: 3, opacity: 0.85,
                               fontSize: 10, color: 'white',
                               display: 'flex', alignItems: 'center', justifyContent: 'center',
                               overflow: 'hidden', whiteSpace: 'nowrap',
                             }}>
-                            {prj?.code || ''}
+                            {trattiPx(calendario.viewUnits(a), p).map(x => (
+                              <span key={x.u} style={{
+                                position: 'absolute', top: 0, bottom: 0, left: x.x0, width: x.x1 - x.x0,
+                                backgroundColor: coloreBarra, pointerEvents: 'none',
+                              }} />
+                            ))}
+                            <span style={{ position: 'relative', textShadow: '0 1px 2px rgba(0,0,0,0.9)' }}>{prj?.code || ''}</span>
                           </div>
                         );
                       })}
@@ -2648,8 +2786,8 @@ const handleSaveActivity = async (activityData) => {
                                   .sort((a, b) => actStartUnit(a) - actStartUnit(b))
                                   .map(activity => {
                                     const techs = activity.technicians || [];
-                                    const inConflict = conflictingActivityIds.has(activity.id)
-                                                    || absenceConflicts.has(activity.id);
+                                    const inConflict = conflictingActivityIds.has(activity.id);
+                                    const conAssenze = absenceConflicts.has(activity.id);
                                     return (
                                       <tr key={activity.id} style={{ borderBottom: '1px solid var(--border)' }}>
                                         <td style={{
@@ -2658,6 +2796,7 @@ const handleSaveActivity = async (activityData) => {
                                         }}>
                                           {activity.archived && <span title={t('archived')}>📦 </span>}
                                           {inConflict && <span title={t('conflict')} style={{ marginRight: 6 }}>⚠</span>}
+                                          {conAssenze && <span title={t('absencesInPlan')} style={{ marginRight: 6 }}>🏖</span>}
                                           {activity.name}
                                         </td>
                                         <td style={{ padding: '7px 12px', color: techs.length ? 'var(--fg)' : 'var(--muted)' }}>
@@ -3065,6 +3204,7 @@ const handleSaveActivity = async (activityData) => {
             activities={activities}
             technicians={technicians}
             absences={absences}
+            calendar={calendario}
             t={t}
             locale={locale}
             canEdit={user?.role === 'admin' || user?.role === 'editor'}
@@ -3150,12 +3290,12 @@ const handleSaveActivity = async (activityData) => {
                       backgroundColor: 'var(--surface2)', padding: '10px 14px', marginBottom: '1rem',
                     }}>
                       <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: '#f59e0b' }}>
-                        🏖 {t('assignedDuringAbsence')}
+                        🏖 {t('absencesInPlan')}
                       </div>
                       {[...absenceIssues.entries()].map(([techName, items]) => (
                         <div key={techName} style={{ marginBottom: 6, fontSize: 13 }}>
                           <strong>{techName}</strong>
-                          <span style={{ color: 'var(--muted)' }}> — {conta(items.length, 'activityCount1', 'activityCount')}</span>
+                          <span style={{ color: 'var(--muted)' }}> — {conta(new Set(items.map(it => it.activity.id)).size, 'activityCount1', 'activityCount')}</span>
                           <div style={{ marginLeft: 14, fontSize: 12, color: 'var(--muted)' }}>
                             {/* Periodo in cui il tecnico lavora sull'attivita' e periodo
                                 dell'assenza, entrambi con la fascia quando non e'
@@ -3215,7 +3355,11 @@ const handleSaveActivity = async (activityData) => {
                                   padding: '12px', marginBottom: 10, backgroundColor: 'var(--surface)',
                                 }}>
                                   <div style={{ fontSize: 13, color: '#dc3545', fontWeight: 600, marginBottom: 8 }}>
-                                    📅 dal {new Date(cf.periodStart).toLocaleDateString(locale)} al {new Date(cf.periodEnd).toLocaleDateString(locale)}
+                                    {/* I giorni in cui gli impegni coincidono davvero, non
+                                        tutto l'intervallo delle attivita' coinvolte */}
+                                    📅 {cf.startDate === cf.endDate
+                                      ? new Date(cf.startDate).toLocaleDateString(locale)
+                                      : `${new Date(cf.startDate).toLocaleDateString(locale)} → ${new Date(cf.endDate).toLocaleDateString(locale)}`}
                                     <span style={{ marginLeft: 8, fontWeight: 400, color: 'var(--muted)' }}>
                                       ({cf.activities.length} {t('overlappingActivities')})
                                     </span>
@@ -3680,9 +3824,12 @@ const handleSaveActivity = async (activityData) => {
               handleSaveActivity({
                 name: formData.get('name'),
                 project_id: parseInt(formData.get('project_id')),
-                // Un periodo per riga; chi non ha nessun giorno viene tolto
-                assignments: toAssignments(selectedTechnicians, formPeriods, formStart, formEnd),
+                // Un periodo per riga; chi non ha nessun giorno viene tolto.
+                // I giorni di riposo lavorati diventano periodi a se'.
+                assignments: toAssignments(selectedTechnicians, formPeriods, formStart, formEnd, formIsRest),
                 required_technicians: formRequired === '' ? '' : Number(formRequired),
+                work_days: formWorkWeek,
+                work_holidays: formWorkHolidays,
                 start_date: formStart,
                 end_date: formEnd,
                 day_part: formDayPart,
@@ -3722,7 +3869,8 @@ const handleSaveActivity = async (activityData) => {
                 <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600' }}>{t('project')}</label>
                 <select
                   name="project_id"
-                  defaultValue={editingActivity?.project_id || ''}
+                  value={formProjectId}
+                  onChange={(e) => setFormProjectId(e.target.value)}
                   required
                   style={{
                     width: '100%',
@@ -3822,6 +3970,48 @@ const handleSaveActivity = async (activityData) => {
                 </label>
               </div>
 
+              {/* Giorni di lavoro: di norma quelli della nazione del progetto.
+                  Un magazzino aperto il sabato, o un cantiere che lavora la
+                  domenica, lo imposta qui una volta sola. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 14, marginRight: 4 }}>{t('workWeek')}:</span>
+                {[1, 2, 3, 4, 5, 6, 0].map(d => {
+                  const attivo = settimanaEffettiva.includes(d);
+                  // Un lunedi' qualsiasi (5 gennaio 2026) piu' d-1 giorni
+                  const nome = new Date(Date.UTC(2026, 0, 4 + d)).toLocaleDateString(locale, { weekday: 'short', timeZone: 'UTC' });
+                  return (
+                    <button key={d} type="button" onClick={() => cambiaGiornoSettimana(d)}
+                      aria-pressed={attivo}
+                      style={{
+                        padding: '3px 7px', minWidth: 38, borderRadius: 5, fontSize: 12, cursor: 'pointer',
+                        border: '1px solid var(--border)',
+                        backgroundColor: attivo ? 'var(--accent)' : 'var(--surface)',
+                        color: attivo ? 'var(--accentFg)' : 'var(--muted)',
+                      }}>
+                      {nome}
+                    </button>
+                  );
+                })}
+                {formWorkWeek ? (
+                  <button type="button" onClick={() => setFormWorkWeek(null)}
+                    style={{ border: 'none', background: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline' }}>
+                    {t('workWeekReset')} {formCountry}
+                  </button>
+                ) : (
+                  <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('workWeekDefault')} {formCountry}</span>
+                )}
+              </div>
+              <div style={{ marginBottom: '0.5rem' }}>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 14, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={formWorkHolidays}
+                    onChange={(e) => setFormWorkHolidays(e.target.checked)}
+                  />
+                  {t('workHolidays')}
+                </label>
+              </div>
+
               <div style={{ marginBottom: '1rem', minHeight: '20px' }}>
                 {dateError ? (
                   <span style={{ color: '#ef4444', fontSize: '0.85rem' }}>
@@ -3837,23 +4027,33 @@ const handleSaveActivity = async (activityData) => {
                         <> · {giorniLavorativi} {t('workingDays')}</>
                       )}
                       {formDayPart !== 'FULL' && (
-                        <> · {formDayPart === 'AM' ? t('onlyMornings') : t('onlyAfternoons')}, {t('equalTo')} {fmtDays(durationDays, locale)} {t('daysWord')}</>
+                        <> · {formDayPart === 'AM' ? t('onlyMornings') : t('onlyAfternoons')}, {t('equalTo')} {fmtDays(durationDays, locale)} {durationDays === 1 ? t('dayWord') : t('daysWord')}</>
                       )}
-                      {includeNonLavorativi && (
+                      {soloRiposo && (
                         <span style={{ color: '#f59e0b', marginLeft: 8 }}>
-                          ⚠ {t('includesNonWorking')}
+                          ⚠ {t('onlyRestDays')}
                         </span>
                       )}
                     </span>
-                    {giorniUomoForm.length > 0 && (
+                    {giorniUomoForm.tecnici.length > 0 && (
                       <div style={{ color: 'var(--muted)', fontSize: '0.85rem', marginTop: 2 }}>
                         {t('plannedManDays')}:{' '}
                         <strong style={{ color: 'var(--fg)' }}>
-                          {fmtDays(giorniUomoForm.reduce((s, [, n]) => s + n, 0), locale)}
+                          {fmtDays(giorniUomoForm.tecnici.reduce((s, [, n]) => s + n, 0), locale)}
                         </strong>
                         {' — '}
-                        {giorniUomoForm.map(([id, n]) =>
+                        {giorniUomoForm.tecnici.map(([id, n]) =>
                           `${(technicians.find(x => x.id === id) || {}).name || '—'} ${fmtDays(n, locale)}`).join(' · ')}
+                      </div>
+                    )}
+                    {giorniUomoForm.stima && (
+                      <div style={{ color: 'var(--muted)', fontSize: '0.85rem', marginTop: 2 }}>
+                        {t('plannedManDays')}:{' '}
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {fmtDays(giorniUomoForm.stima.richiesti * giorniUomoForm.stima.giorni, locale)}
+                        </strong>
+                        {' — '}
+                        {giorniUomoForm.stima.richiesti} {t('requiredTechs').toLowerCase()} × {fmtDays(giorniUomoForm.stima.giorni, locale)} {t('daysWord')}
                       </div>
                     )}
                   </>
@@ -4032,8 +4232,10 @@ const handleSaveActivity = async (activityData) => {
                 onRequiredChange={setFormRequired}
                 absences={absences}
                 otherViews={impegniAltrove}
-                dayKind={(g) => (holidays.some(h => (h.country || '').trim() === formCountry && isoDay(h.date) === g) ? 'holiday'
-                  : isNonWorking(g, formCountry, holidays, weekendMap) ? 'rest' : null)}
+                dayKind={(g) => (calendario.isHoliday(formCountry, g) ? 'holiday'
+                  : formIsRest(g) ? 'rest' : null)}
+                isRest={formIsRest}
+                calendar={calendario}
                 locale={locale}
                 t={t}
               />
